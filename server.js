@@ -177,6 +177,97 @@ app.post('/create-order', async (req, res) => {
 });
 
 // ─────────────────────────────────────────────────────────────────────────────
+// POST /create-token-order
+// Flutter calls this to buy add-on AI token packs (10,000 tokens each).
+//
+// Request body:
+//   tokenPacks  number  (how many 10k packs — always 1 from ai_chat_screen)
+//   userEmail   string
+//   userName    string
+//   userPhone   string
+//   uid         Firebase UID
+//
+// Response:
+//   { orderId, paymentSessionId, amountINR, environment }
+// ─────────────────────────────────────────────────────────────────────────────
+app.post('/create-token-order', async (req, res) => {
+  try {
+    const { tokenPacks, userEmail, userName, userPhone, uid } = req.body;
+
+    const packs = parseInt(tokenPacks, 10);
+    if (!packs || packs < 1 || packs > 100) {
+      return res.status(400).json({ error: 'tokenPacks must be between 1 and 100.' });
+    }
+    if (!uid || !userEmail) {
+      return res.status(400).json({ error: 'uid and userEmail are required.' });
+    }
+
+    // Fetch token pack price server-side from Firestore
+    const snap = await db.collection('pricing_config').doc('plans').get();
+    const tokenPackPrice = snap.exists
+      ? Number(snap.data().token_pack_price ?? 10)
+      : 10;
+
+    const amountINR = tokenPackPrice * packs;
+    if (amountINR <= 0) {
+      return res.status(500).json({ error: 'Token pack price not configured.' });
+    }
+
+    const orderId = `TOK_${uid.substring(0, 6)}_${uuidv4().replace(/-/g, '').substring(0, 10)}`.toUpperCase();
+
+    const cfPayload = {
+      order_id:       orderId,
+      order_amount:   amountINR,
+      order_currency: 'INR',
+      customer_details: {
+        customer_id:    uid,
+        customer_email: userEmail,
+        customer_name:  userName  || 'Customer',
+        customer_phone: userPhone || '9999999999',
+      },
+      order_note: `${packs * 10000} AI tokens (${packs} pack${packs > 1 ? 's' : ''}) — ${CF_ENV}`,
+    };
+
+    const cfRes = await axios.post(
+      `${CF_BASE_URL}/orders`,
+      cfPayload,
+      { headers: cfHeaders() }
+    );
+
+    const paymentSessionId = cfRes.data?.payment_session_id;
+    if (!paymentSessionId) {
+      console.error('Cashfree did not return payment_session_id:', cfRes.data);
+      return res.status(500).json({ error: 'Cashfree did not return a payment session.' });
+    }
+
+    // Log to Firestore for audit
+    await db.collection('orders').doc(orderId).set({
+      orderId,
+      uid,
+      userEmail,
+      orderType:   'tokens',
+      tokenPacks:  packs,
+      amountINR,
+      status:      'pending',
+      environment: CF_ENV,
+      createdAt:   admin.firestore.FieldValue.serverTimestamp(),
+    });
+
+    return res.status(200).json({
+      orderId,
+      paymentSessionId,
+      amountINR,
+      environment: CF_ENV,
+    });
+
+  } catch (err) {
+    const msg = err?.response?.data?.message || err.message || 'Token order creation failed.';
+    console.error('create-token-order error:', err?.response?.data || err.message);
+    return res.status(500).json({ error: msg });
+  }
+});
+
+// ─────────────────────────────────────────────────────────────────────────────
 // POST /verify-payment   (optional — for webhook or manual verification)
 // Cashfree calls this after payment, OR Flutter can call it to double-check.
 // Set as webhook URL in Cashfree Dashboard → Developers → Webhooks.
