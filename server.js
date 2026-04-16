@@ -23,6 +23,20 @@ const app = express();
 app.use(express.json());
 
 // ─────────────────────────────────────────────────────────────────────────────
+// CORS — Flutter hits the server from a mobile device (no browser origin),
+// but Render's free tier can return an HTML splash page on cold start.
+// Setting explicit JSON Content-Type on every response prevents the Flutter
+// client from seeing unexpected HTML and showing "wait 30 sec" errors.
+// ─────────────────────────────────────────────────────────────────────────────
+app.use((req, res, next) => {
+  res.setHeader('Access-Control-Allow-Origin', '*');
+  res.setHeader('Access-Control-Allow-Headers', 'Content-Type, Authorization');
+  res.setHeader('Access-Control-Allow-Methods', 'GET, POST, OPTIONS');
+  if (req.method === 'OPTIONS') return res.sendStatus(204);
+  next();
+});
+
+// ─────────────────────────────────────────────────────────────────────────────
 // Firebase Admin SDK
 // ─────────────────────────────────────────────────────────────────────────────
 admin.initializeApp({
@@ -385,6 +399,20 @@ app.post('/update-pricing', async (req, res) => {
     console.error('update-pricing error:', err.message);
     return res.status(500).json({ error: 'Failed to update pricing.' });
   }
+});
+
+// ─────────────────────────────────────────────────────────────────────────────
+// GET /  — Default route so Render never serves its HTML splash page.
+//          Flutter parses content-type: application/json; an HTML response
+//          was triggering the "wait 30 sec" cold-start error in the app.
+// ─────────────────────────────────────────────────────────────────────────────
+app.get('/', (_, res) => {
+  res.status(200).json({
+    service:     'Astric Payment Server',
+    status:      'ok',
+    environment: CF_ENV,
+    timestamp:   new Date().toISOString(),
+  });
 });
 
 // ─────────────────────────────────────────────────────────────────────────────
