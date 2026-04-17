@@ -862,3 +862,16 @@ app.get('/debug-paypal', (_, res) => {
     base_url:         PP_BASE_URL,
   });
 });
+app.get('/debug-paypal-token', async (_, res) => {
+  try {
+    const token = await getPayPalAccessToken();
+    res.json({ success: true, token_preview: token.substring(0, 20) + '...' });
+  } catch (err) {
+    res.json({
+      success: false,
+      status: err?.response?.status,
+      data: err?.response?.data,
+      message: err.message,
+    });
+  }
+});
