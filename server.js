@@ -567,7 +567,7 @@ app.post('/paypal/create-order', async (req, res) => {
       application_context: {
         brand_name: 'Astric',
         locale: 'en-US',
-        landing_page: 'LOGIN',
+        landing_page: 'NO_PREFERENCE',
         user_action: 'PAY_NOW',
         // After approval PayPal redirects here — server captures and stores subscription
         return_url: `${process.env.SERVER_BASE_URL || 'https://your-server.onrender.com'}/paypal/capture-order?internalOrderId=${orderId}&uid=${uid}&planType=${planType}&cycle=${cycle}`,
