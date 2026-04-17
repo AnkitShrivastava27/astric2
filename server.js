@@ -851,8 +851,8 @@ app.get('/paypal/config', (_, res) => {
     clientId: PP_CLIENT_ID,
   });
 });
-const PP_CLIENT_ID     = process.env.PAYPAL_CLIENT_ID     || '';  // empty!
-const PP_CLIENT_SECRET = process.env.PAYPAL_CLIENT_SECRET || '';  // empty!
+
+
 app.get('/debug-paypal', (_, res) => {
   res.json({
     PP_ENV,
