@@ -851,3 +851,14 @@ app.get('/paypal/config', (_, res) => {
     clientId: PP_CLIENT_ID,
   });
 });
+const PP_CLIENT_ID     = process.env.PAYPAL_CLIENT_ID     || '';  // empty!
+const PP_CLIENT_SECRET = process.env.PAYPAL_CLIENT_SECRET || '';  // empty!
+app.get('/debug-paypal', (_, res) => {
+  res.json({
+    PP_ENV,
+    clientId_set:     PP_CLIENT_ID.length > 0,
+    secret_set:       PP_CLIENT_SECRET.length > 0,
+    clientId_preview: PP_CLIENT_ID.substring(0, 10) + '...',
+    base_url:         PP_BASE_URL,
+  });
+});
