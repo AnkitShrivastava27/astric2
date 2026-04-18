@@ -80,7 +80,7 @@ const PP_BASE_URL = PP_ENV === 'LIVE'
   ? 'https://api-m.paypal.com'
   : 'https://api-m.sandbox.paypal.com';
 
-// ── FIX: strip any trailing slash from SERVER_BASE_URL so URLs never get // ──
+// Strip any trailing slash from SERVER_BASE_URL so URLs never get //
 const SERVER_BASE_URL = (process.env.SERVER_BASE_URL || 'https://astricserver.onrender.com').replace(/\/+$/, '');
 
 const FALLBACK_USD_INR_RATE = 83.5;
@@ -249,7 +249,7 @@ app.post('/create-order', async (req, res) => {
 });
 
 // ─────────────────────────────────────────────────────────────────────────────
-// POST /create-token-order   (Cashfree token pack)
+// POST /create-token-order   (Cashfree token pack — creates order only)
 // ─────────────────────────────────────────────────────────────────────────────
 app.post('/create-token-order', async (req, res) => {
   try {
@@ -300,6 +300,8 @@ app.post('/create-token-order', async (req, res) => {
       return res.status(500).json({ error: 'Cashfree did not return a payment session.' });
     }
 
+    // Store order with status 'pending' — tokens are NOT credited here.
+    // /fulfill-token-order (called by Flutter after SDK success) does the credit.
     await db.collection('orders').doc(orderId).set({
       orderId,
       uid,
@@ -322,6 +324,84 @@ app.post('/create-token-order', async (req, res) => {
   } catch (err) {
     const msg = err?.response?.data?.message || err.message || 'Token order creation failed.';
     console.error('create-token-order error:', err?.response?.data || err.message);
+    return res.status(500).json({ error: msg });
+  }
+});
+
+// ─────────────────────────────────────────────────────────────────────────────
+// POST /fulfill-token-order   (Cashfree token fulfillment)
+//
+// Flutter calls this AFTER the Cashfree SDK fires onSuccess.
+// This endpoint:
+//   1. Checks our orders doc to prevent double-crediting (idempotency guard)
+//   2. Verifies payment status with Cashfree API
+//   3. Marks order as paid
+//   4. Increments addonTokens on the root user doc (same field _load() reads)
+//
+// This is the ONLY place addonTokens gets incremented for Cashfree purchases.
+// Flutter must NOT call addAddonTokens() — just call reload() after this.
+// ─────────────────────────────────────────────────────────────────────────────
+app.post('/fulfill-token-order', async (req, res) => {
+  try {
+    const { orderId, uid } = req.body;
+    if (!orderId || !uid) {
+      return res.status(400).json({ error: 'orderId and uid are required.' });
+    }
+
+    // 1. Load our order record
+    const orderSnap = await db.collection('orders').doc(orderId).get();
+    if (!orderSnap.exists) {
+      return res.status(404).json({ error: 'Order not found.' });
+    }
+    const orderData = orderSnap.data();
+
+    if (orderData.orderType !== 'tokens') {
+      return res.status(400).json({ error: 'Not a token order.' });
+    }
+
+    // 2. Idempotency guard — already fulfilled, return success so Flutter
+    //    reload() picks up the correct value without double-crediting.
+    if (orderData.status === 'paid') {
+      console.log(`fulfill-token-order: already fulfilled, skipping credit. orderId=${orderId}`);
+      return res.status(200).json({
+        success:        true,
+        alreadyCredited: true,
+        tokensAdded:    orderData.tokenPacks * 10000,
+      });
+    }
+
+    // 3. Verify with Cashfree that payment actually succeeded
+    const cfRes = await axios.get(
+      `${CF_BASE_URL}/orders/${orderId}`,
+      { headers: cfHeaders() }
+    );
+    const orderStatus = cfRes.data?.order_status;
+
+    if (orderStatus !== 'PAID') {
+      console.warn(`fulfill-token-order: Cashfree status not PAID (${orderStatus}) for orderId=${orderId}`);
+      return res.status(400).json({ error: `Payment not complete. Cashfree status: ${orderStatus}` });
+    }
+
+    const tokensAdded = orderData.tokenPacks * 10000;
+
+    // 4. Mark paid FIRST (prevents a race condition if Flutter taps twice)
+    await db.collection('orders').doc(orderId).update({
+      status:      'paid',
+      activatedAt: admin.firestore.FieldValue.serverTimestamp(),
+      cfOrderData: cfRes.data,
+    });
+
+    // 5. Increment addonTokens on root user doc — single source of truth
+    await db.collection('users').doc(uid).update({
+      addonTokens: admin.firestore.FieldValue.increment(tokensAdded),
+    });
+
+    console.log(`Cashfree tokens fulfilled: uid=${uid} tokens=${tokensAdded} orderId=${orderId}`);
+    return res.status(200).json({ success: true, tokensAdded });
+
+  } catch (err) {
+    const msg = err?.response?.data?.message || err.message || 'Token fulfillment failed.';
+    console.error('fulfill-token-order error:', err?.response?.data || err.message);
     return res.status(500).json({ error: msg });
   }
 });
@@ -465,7 +545,6 @@ app.post('/paypal/create-order', async (req, res) => {
         locale:       'en-US',
         landing_page: 'NO_PREFERENCE',
         user_action:  'PAY_NOW',
-        // FIX: SERVER_BASE_URL already has trailing slash stripped at startup
         return_url: `${SERVER_BASE_URL}/paypal/capture-order?internalOrderId=${orderId}&uid=${uid}&planType=${planType}&cycle=${cycle}`,
         cancel_url: `${SERVER_BASE_URL}/paypal/cancel?orderId=${orderId}`,
       },
@@ -635,7 +714,6 @@ app.post('/paypal/create-token-order', async (req, res) => {
       application_context: {
         brand_name:  'Astric',
         user_action: 'PAY_NOW',
-        // FIX: SERVER_BASE_URL already has trailing slash stripped at startup
         return_url: `${SERVER_BASE_URL}/paypal/capture-token-order?internalOrderId=${orderId}&uid=${uid}&tokenPacks=${packs}`,
         cancel_url: `${SERVER_BASE_URL}/paypal/cancel?orderId=${orderId}`,
       },
@@ -675,7 +753,8 @@ app.post('/paypal/create-token-order', async (req, res) => {
 
 // ─────────────────────────────────────────────────────────────────────────────
 // GET /paypal/capture-token-order
-// PayPal redirects here after token-pack approval. Adds tokens to Firestore.
+// PayPal redirects here after token-pack approval.
+// Idempotency guard prevents double-credit if WebView reloads the URL.
 // Flutter WebView detects this URL and closes.
 // ─────────────────────────────────────────────────────────────────────────────
 app.get('/paypal/capture-token-order', async (req, res) => {
@@ -687,6 +766,17 @@ app.get('/paypal/capture-token-order', async (req, res) => {
   }
 
   try {
+    // Idempotency guard — if already paid don't capture or credit again
+    const existingSnap = await db.collection('orders').doc(internalOrderId).get();
+    if (existingSnap.exists && existingSnap.data().status === 'paid') {
+      console.log(`paypal/capture-token-order: already paid, skipping. orderId=${internalOrderId}`);
+      return res.status(200).json({
+        success:         true,
+        alreadyCredited: true,
+        tokensAdded:     packs * 10000,
+      });
+    }
+
     const accessToken = await getPayPalAccessToken();
     const captureRes  = await axios.post(
       `${PP_BASE_URL}/v2/checkout/orders/${ppOrderId}/capture`,
@@ -707,15 +797,17 @@ app.get('/paypal/capture-token-order', async (req, res) => {
 
     const tokensAdded = packs * 10000;
 
-    await db.collection('users').doc(uid).update({
-      addonTokens: admin.firestore.FieldValue.increment(tokensAdded),
-    });
-
+    // Mark paid FIRST — prevents race condition on double navigation
     await db.collection('orders').doc(internalOrderId).update({
       status:          'paid',
       ppCaptureId:     captureId,
       ppCaptureStatus: captureStatus,
       activatedAt:     admin.firestore.FieldValue.serverTimestamp(),
+    });
+
+    // Increment addonTokens on root user doc — single source of truth
+    await db.collection('users').doc(uid).update({
+      addonTokens: admin.firestore.FieldValue.increment(tokensAdded),
     });
 
     console.log(`PayPal tokens added: uid=${uid} tokens=${tokensAdded} captureId=${captureId}`);
