@@ -15,7 +15,15 @@
  *  PAYPAL_CLIENT_SECRET   Your PayPal REST app Secret
  *  PAYPAL_ENV             "SANDBOX" or "LIVE"
  *  SERVER_BASE_URL        e.g. https://astricserver.onrender.com  ← NO trailing slash
- *  PORT                   Set automatically by Render — don't set manually
+ *  PORT                   Set automatically by Render -- don't set manually
+ *
+ *  -- EmailJS (moved OFF Flutter client - never expose in app source) --------
+ *  EMAILJS_SERVICE_ID     Your EmailJS service ID  (e.g. Astricservice)
+ *  EMAILJS_TEMPLATE_ID    Your EmailJS template ID (e.g. AstricTemp)
+ *  EMAILJS_PUBLIC_KEY     Your EmailJS public key  (e.g. D4bKTz9ziK50VZa7W)
+ *
+ *  -- AI --------------------------------------------------------------------
+ *  DEEPSEEK_API_KEY       DeepSeek API key -- Flutter fetches via GET /config
  */
 
 const express = require('express');
@@ -84,6 +92,26 @@ const PP_BASE_URL = PP_ENV === 'LIVE'
 const SERVER_BASE_URL = (process.env.SERVER_BASE_URL || 'https://astricserver.onrender.com').replace(/\/+$/, '');
 
 const FALLBACK_USD_INR_RATE = 83.5;
+
+// -----------------------------------------------------------------------------
+// EmailJS config (read from env -- never hardcode in Flutter source)
+// -----------------------------------------------------------------------------
+const EMAILJS_SERVICE_ID  = process.env.EMAILJS_SERVICE_ID  || '';
+const EMAILJS_TEMPLATE_ID = process.env.EMAILJS_TEMPLATE_ID || '';
+const EMAILJS_PUBLIC_KEY  = process.env.EMAILJS_PUBLIC_KEY  || '';
+
+// -----------------------------------------------------------------------------
+// DeepSeek / AI config
+// -----------------------------------------------------------------------------
+const DEEPSEEK_API_KEY = process.env.DEEPSEEK_API_KEY || '';
+
+// Default AI token limits per plan (overridden by Firestore ai_limits/config)
+const DEFAULT_AI_LIMITS = {
+  basic_tokens_limit:    5000,
+  standard_tokens_limit: 50000,
+  premium_tokens_limit:  200000,
+  token_pack_size:       10000,   // tokens per addon pack purchase
+};
 
 // PayPal OAuth token cache (expires after ~9 hours)
 let _ppTokenCache = { token: '', expiresAt: 0 };
@@ -859,6 +887,142 @@ app.get('/debug-paypal-token', async (_, res) => {
   }
 });
 
+
+// =============================================================================
+// GET /config
+// Flutter calls this ONCE on startup to fetch all non-secret runtime config:
+// EmailJS creds, DeepSeek key, Cashfree/PayPal env, and AI token limits.
+// Replaces hardcoded values in app_env.dart and email_service.dart.
+// =============================================================================
+app.get('/config', async (_, res) => {
+  try {
+    const limitsSnap = await db.collection('ai_limits').doc('config').get();
+    const limits = limitsSnap.exists
+      ? { ...DEFAULT_AI_LIMITS, ...limitsSnap.data() }
+      : { ...DEFAULT_AI_LIMITS };
+
+    return res.status(200).json({
+      emailjs: {
+        serviceId:  EMAILJS_SERVICE_ID,
+        templateId: EMAILJS_TEMPLATE_ID,
+        publicKey:  EMAILJS_PUBLIC_KEY,
+      },
+      deepseekApiKey: DEEPSEEK_API_KEY,
+      cashfreeEnv:    CF_ENV,
+      paypalEnv:      PP_ENV,
+      aiLimits: {
+        basicTokensLimit:    limits.basic_tokens_limit,
+        standardTokensLimit: limits.standard_tokens_limit,
+        premiumTokensLimit:  limits.premium_tokens_limit,
+        tokenPackSize:       limits.token_pack_size,
+      },
+    });
+  } catch (err) {
+    console.error('/config error:', err.message);
+    return res.status(500).json({ error: 'Failed to load config.' });
+  }
+});
+
+// =============================================================================
+// GET /ai-limits
+// Returns current per-plan token limits from Firestore.
+// Flutter aiLimitsProvider calls this to get live limits without a full /config.
+// =============================================================================
+app.get('/ai-limits', async (_, res) => {
+  try {
+    const snap = await db.collection('ai_limits').doc('config').get();
+    const limits = snap.exists
+      ? { ...DEFAULT_AI_LIMITS, ...snap.data() }
+      : { ...DEFAULT_AI_LIMITS };
+
+    return res.status(200).json({
+      basicTokensLimit:    limits.basic_tokens_limit,
+      standardTokensLimit: limits.standard_tokens_limit,
+      premiumTokensLimit:  limits.premium_tokens_limit,
+      tokenPackSize:       limits.token_pack_size,
+      source:              snap.exists ? 'firestore' : 'defaults',
+    });
+  } catch (err) {
+    console.error('/ai-limits error:', err.message);
+    return res.status(500).json({ error: 'Failed to load AI limits.' });
+  }
+});
+
+// =============================================================================
+// POST /update-ai-limits
+// Admin-only. Update per-plan token limits stored in Firestore ai_limits/config.
+// Same auth as /update-pricing: Bearer ADMIN_API_KEY header.
+//
+// Writable fields (all optional, must be non-negative integers):
+//   basic_tokens_limit      -- tokens/month for Basic plan
+//   standard_tokens_limit   -- tokens/month for Standard plan
+//   premium_tokens_limit    -- tokens/month for Premium plan
+//   token_pack_size         -- tokens credited per addon pack purchase
+//
+// Example:
+//   curl -X POST https://yourserver.onrender.com/update-ai-limits \
+//     -H "Authorization: Bearer YOUR_ADMIN_KEY" \
+//     -H "Content-Type: application/json" \
+//     -d '{"standard_tokens_limit": 75000, "premium_tokens_limit": 300000}'
+// =============================================================================
+app.post('/update-ai-limits', async (req, res) => {
+  const token    = (req.headers['authorization'] || '').replace('Bearer ', '').trim();
+  const adminKey = process.env.ADMIN_API_KEY || '';
+
+  if (!adminKey) {
+    return res.status(500).json({ error: 'ADMIN_API_KEY not configured on server.' });
+  }
+  if (token !== adminKey) {
+    return res.status(401).json({ error: 'Unauthorized.' });
+  }
+
+  try {
+    const limitFields = [
+      'basic_tokens_limit',
+      'standard_tokens_limit',
+      'premium_tokens_limit',
+      'token_pack_size',
+    ];
+
+    const update = {};
+
+    for (const key of limitFields) {
+      if (req.body[key] !== undefined) {
+        const val = Number(req.body[key]);
+        if (!Number.isInteger(val) || val < 0) {
+          return res.status(400).json({ error: `${key} must be a non-negative integer.` });
+        }
+        update[key] = val;
+      }
+    }
+
+    if (Object.keys(update).length === 0) {
+      return res.status(400).json({ error: 'No valid fields provided.' });
+    }
+
+    update.updated_at = admin.firestore.FieldValue.serverTimestamp();
+    update.updated_by = req.body.updatedBy || 'admin';
+
+    await db.collection('ai_limits').doc('config').set(update, { merge: true });
+
+    const updatedFields = Object.keys(update).filter(
+      k => k !== 'updated_at' && k !== 'updated_by'
+    );
+
+    console.log(`AI limits updated by "${update.updated_by}":`, updatedFields);
+
+    return res.status(200).json({
+      success: true,
+      updated: updatedFields,
+      message: 'Done. Flutter app reflects new limits within ~1 second.',
+    });
+
+  } catch (err) {
+    console.error('/update-ai-limits error:', err.message);
+    return res.status(500).json({ error: 'Failed to update AI limits.' });
+  }
+});
+
 // ─────────────────────────────────────────────────────────────────────────────
 // Start server
 // ─────────────────────────────────────────────────────────────────────────────
@@ -868,5 +1032,7 @@ app.listen(PORT, () => {
   console.log(`    Cashfree    : ${CF_ENV}  →  ${CF_BASE_URL}`);
   console.log(`    PayPal      : ${PP_ENV}  →  ${PP_BASE_URL}`);
   console.log(`    Server URL  : ${SERVER_BASE_URL}`);
-  console.log(`    Firebase    : ${process.env.FIREBASE_PROJECT_ID}\n`);
+  console.log(`    Firebase    : ${process.env.FIREBASE_PROJECT_ID}`);
+  console.log(`    EmailJS     : serviceId=${EMAILJS_SERVICE_ID || '(not set)'}`);
+  console.log(`    DeepSeek    : key_set=${DEEPSEEK_API_KEY.length > 0}\n`);
 });
