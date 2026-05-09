@@ -891,15 +891,48 @@ app.get('/debug-paypal-token', async (_, res) => {
 // =============================================================================
 // GET /config
 // Flutter calls this ONCE on startup to fetch all non-secret runtime config:
-// EmailJS creds, DeepSeek key, Cashfree/PayPal env, and AI token limits.
-// Replaces hardcoded values in app_env.dart and email_service.dart.
+// EmailJS creds, DeepSeek key, Cashfree/PayPal env, AI token limits,
+// and plan gating (screenAccess + screenLimits from appConfig/planGating).
 // =============================================================================
 app.get('/config', async (_, res) => {
   try {
+    // ── AI limits ─────────────────────────────────────────────────────────────
     const limitsSnap = await db.collection('ai_limits').doc('config').get();
     const limits = limitsSnap.exists
       ? { ...DEFAULT_AI_LIMITS, ...limitsSnap.data() }
       : { ...DEFAULT_AI_LIMITS };
+
+    // ── Screen access / plan gating ───────────────────────────────────────────
+    const DEFAULT_SCREEN_ACCESS = {
+      finance: 'basic', invoices: 'basic', customers: 'basic', leads: 'basic',
+      projects: 'basic', tasks: 'basic', employees: 'basic', sales: 'basic',
+      currency: 'basic', files: 'basic',
+      reports: 'standard', kpis: 'standard', ai_chat: 'standard',
+      email: 'standard', team_chat: 'standard', unified_inbox: 'standard',
+      integrations: 'standard', data_storage: 'standard',
+      pdf_analyst: 'premium',
+    };
+    const DEFAULT_SCREEN_LIMITS = {
+      max_employees_basic: 3,    max_employees_standard: 10,  max_employees_premium: 20,
+      max_integrations_basic: 2, max_integrations_standard: 6, max_integrations_premium: -1,
+      max_storage_mb_basic: 500, max_storage_mb_standard: 5120, max_storage_mb_premium: -1,
+      ai_tokens_basic: 10000,    ai_tokens_standard: 50000,   ai_tokens_premium: 200000,
+    };
+
+    let screenAccess = DEFAULT_SCREEN_ACCESS;
+    let screenLimits = DEFAULT_SCREEN_LIMITS;
+
+    try {
+      const gatingSnap = await db.collection('appConfig').doc('planGating').get();
+      if (gatingSnap.exists) {
+        const gatingData = gatingSnap.data();
+        if (gatingData.screenAccess) screenAccess = { ...DEFAULT_SCREEN_ACCESS, ...gatingData.screenAccess };
+        if (gatingData.screenLimits) screenLimits = { ...DEFAULT_SCREEN_LIMITS, ...gatingData.screenLimits };
+      }
+    } catch (gatingErr) {
+      // Don't break the whole /config response if this read fails
+      console.warn('[config] Could not read appConfig/planGating:', gatingErr.message);
+    }
 
     return res.status(200).json({
       emailjs: {
@@ -916,6 +949,8 @@ app.get('/config', async (_, res) => {
         premiumTokensLimit:  limits.premium_tokens_limit,
         tokenPackSize:       limits.token_pack_size,
       },
+      screenAccess,
+      screenLimits,
     });
   } catch (err) {
     console.error('/config error:', err.message);
