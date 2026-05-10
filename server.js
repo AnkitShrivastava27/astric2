@@ -435,6 +435,105 @@ app.post('/fulfill-token-order', async (req, res) => {
 });
 
 // ─────────────────────────────────────────────────────────────────────────────
+// POST /verify-plan-order   (Cashfree plan — verify + activate)
+//
+// Flutter calls this AFTER the Cashfree SDK fires onSuccess for a PLAN purchase.
+// Flow mirrors /fulfill-token-order:
+//   1. Idempotency guard  — already activated → return success, skip re-write
+//   2. Verify with Cashfree API that order_status === 'PAID'
+//   3. Mark order as paid
+//   4. Write subscription to users/{uid}.subscription in Firestore
+//
+// Flutter must NOT activate the plan client-side. It calls this endpoint,
+// awaits a 200 with status:'PAID', then calls reload() to refresh local state.
+// ─────────────────────────────────────────────────────────────────────────────
+app.post('/verify-plan-order', async (req, res) => {
+  try {
+    const { orderId, uid } = req.body;
+    if (!orderId || !uid) {
+      return res.status(400).json({ error: 'orderId and uid are required.' });
+    }
+
+    // 1. Load our order record
+    const orderSnap = await db.collection('orders').doc(orderId).get();
+    if (!orderSnap.exists) {
+      return res.status(404).json({ error: 'Order not found.' });
+    }
+    const orderData = orderSnap.data();
+
+    // 2. Idempotency guard — already activated, just return success
+    if (orderData.status === 'paid') {
+      console.log(`verify-plan-order: already activated, skipping. orderId=${orderId}`);
+      return res.status(200).json({
+        success:        true,
+        alreadyActived: true,
+        status:         'PAID',
+        planType:       orderData.planType,
+        cycle:          orderData.cycle,
+      });
+    }
+
+    // 3. Verify with Cashfree that payment actually succeeded
+    const cfRes = await axios.get(
+      `${CF_BASE_URL}/orders/${orderId}`,
+      { headers: cfHeaders() }
+    );
+    const orderStatus = cfRes.data?.order_status;
+
+    if (orderStatus !== 'PAID') {
+      console.warn(`verify-plan-order: Cashfree status not PAID (${orderStatus}) for orderId=${orderId}`);
+      return res.status(400).json({
+        error:  `Payment not complete. Cashfree status: ${orderStatus}`,
+        status: orderStatus,
+      });
+    }
+
+    const { planType, cycle } = orderData;
+
+    // 4. Mark order paid FIRST (prevents race if Flutter calls this twice)
+    await db.collection('orders').doc(orderId).update({
+      status:      'paid',
+      activatedAt: admin.firestore.FieldValue.serverTimestamp(),
+      cfOrderData: cfRes.data,
+    });
+
+    // 5. Write subscription to Firestore — single source of truth
+    const now    = new Date();
+    const expiry = cycle === 'monthly'
+      ? new Date(now.getFullYear(), now.getMonth() + 1, now.getDate())
+      : new Date(now.getFullYear() + 1, now.getMonth(), now.getDate());
+
+    const subscriptionData = {
+      plan:              planType,
+      cycle,
+      active:            true,
+      purchasedAt:       admin.firestore.Timestamp.fromDate(now),
+      expiresAt:         admin.firestore.Timestamp.fromDate(expiry),
+      cashfreeOrderId:   orderId,
+      cashfreePaymentId: cfRes.data?.cf_payment_id || orderId,
+      gateway:           'cashfree',
+    };
+
+    await db.collection('users').doc(uid).update({ subscription: subscriptionData });
+
+    console.log(`Cashfree plan activated: uid=${uid} plan=${planType}/${cycle} orderId=${orderId}`);
+
+    return res.status(200).json({
+      success:        true,
+      status:         'PAID',
+      planType,
+      cycle,
+      activatedUntil: expiry.toISOString(),
+    });
+
+  } catch (err) {
+    const msg = err?.response?.data?.message || err.message || 'Plan verification failed.';
+    console.error('verify-plan-order error:', err?.response?.data || err.message);
+    return res.status(500).json({ error: msg });
+  }
+});
+
+// ─────────────────────────────────────────────────────────────────────────────
 // POST /verify-payment   (Cashfree webhook / manual check)
 // ─────────────────────────────────────────────────────────────────────────────
 app.post('/verify-payment', async (req, res) => {
@@ -630,6 +729,19 @@ app.get('/paypal/capture-order', async (req, res) => {
   }
 
   try {
+    // ── Idempotency guard — WebView can fire onPageFinished twice for the
+    //    same capture URL. If already paid, return success without re-capturing.
+    const existingSnap = await db.collection('orders').doc(internalOrderId).get();
+    if (existingSnap.exists && existingSnap.data().status === 'paid') {
+      console.log(`paypal/capture-order: already paid, skipping. orderId=${internalOrderId}`);
+      return res.status(200).json({
+        success:         true,
+        alreadyCredited: true,
+        plan:            existingSnap.data().planType,
+        cycle:           existingSnap.data().cycle,
+      });
+    }
+
     const accessToken = await getPayPalAccessToken();
 
     const captureRes = await axios.post(
@@ -906,7 +1018,7 @@ app.get('/config', async (_, res) => {
     const DEFAULT_SCREEN_ACCESS = {
       finance: 'basic', invoices: 'basic', customers: 'basic', leads: 'basic',
       projects: 'basic', tasks: 'basic', employees: 'basic', sales: 'basic',
-      currency: 'basic', files: 'basic',
+      currency: 'basic', files: 'basic', notes: 'basic', calendar: 'basic',
       reports: 'standard', kpis: 'standard', ai_chat: 'standard',
       email: 'standard', team_chat: 'standard', unified_inbox: 'standard',
       integrations: 'standard', data_storage: 'standard',
@@ -1058,9 +1170,497 @@ app.post('/update-ai-limits', async (req, res) => {
   }
 });
 
+// =============================================================================
+// UNIFIED MESSAGING SYSTEM
+// Handles incoming webhooks from WhatsApp, Instagram, Messenger, Telegram
+// and outbound reply sending for all platforms.
+//
+// Required ENV vars (add to Render):
+//   META_VERIFY_TOKEN       — any string you choose, same for all Meta webhooks
+//   META_APP_SECRET         — from Meta App → Settings → Basic → App Secret
+//   TELEGRAM_BOT_TOKEN      — from @BotFather
+//
+// Per-user credentials (stored in Firestore users/{uid}/connectedChannels/*)
+// are fetched dynamically so each user has their own API keys.
+// =============================================================================
+
+const crypto = require('crypto');
+
+const META_VERIFY_TOKEN = process.env.META_VERIFY_TOKEN || 'astric_verify_token';
+const META_APP_SECRET   = process.env.META_APP_SECRET   || '';
+const TELEGRAM_BOT_TOKEN = process.env.TELEGRAM_BOT_TOKEN || '';
+
 // ─────────────────────────────────────────────────────────────────────────────
+// Helpers
+// ─────────────────────────────────────────────────────────────────────────────
+
+// Write an incoming message to Firestore under the org owner's uid
+async function saveIncomingMessage({ uid, channel, contactId, contactName, text, mediaUrl }) {
+  const now    = new Date().toISOString();
+  const convoId = `${channel}_${contactId}`;
+
+  const convoRef = db
+    .collection('users').doc(uid)
+    .collection('conversations').doc(convoId);
+
+  const msgRef = convoRef.collection('messages').doc();
+
+  const batch = db.batch();
+
+  // Upsert conversation doc
+  batch.set(convoRef, {
+    channel,
+    contactId,
+    contactName:   contactName || contactId,
+    lastMessage:   text || '📎 Media',
+    lastMessageAt: now,
+    isResolved:    false,
+  }, { merge: true });
+
+  // Increment unread count
+  batch.set(convoRef, {
+    unreadCount: admin.firestore.FieldValue.increment(1),
+  }, { merge: true });
+
+  // Write message
+  batch.set(msgRef, {
+    conversationId: convoId,
+    text:           text || '',
+    mediaUrl:       mediaUrl || null,
+    isOutbound:     false,
+    sentAt:         now,
+    isRead:         false,
+    channel,
+    status:         'received',
+  });
+
+  await batch.commit();
+  console.log(`[messaging] Saved incoming ${channel} msg from ${contactId} → uid ${uid}`);
+}
+
+// Find which org-owner uid has a connected channel matching contactId/pageId
+// For simplicity we store a reverse-lookup: channelType → uid in appConfig/channelIndex
+// When a user connects a channel, we write their uid there so webhooks can route correctly.
+async function findUidForChannel(channelType, channelAccountId) {
+  try {
+    const snap = await db
+      .collection('appConfig')
+      .doc('channelIndex')
+      .get();
+
+    if (!snap.exists) return null;
+    const data = snap.data();
+    // Structure: { 'whatsapp_<phoneNumberId>': uid, 'telegram_<botUsername>': uid, ... }
+    return data[`${channelType}_${channelAccountId}`] || null;
+  } catch (_) {
+    return null;
+  }
+}
+
+// Fetch a user's channel credentials from Firestore
+async function getChannelCreds(uid, channelType) {
+  try {
+    const snap = await db
+      .collection('users').doc(uid)
+      .collection('connectedChannels').doc(channelType)
+      .get();
+    return snap.exists ? snap.data().credentials : null;
+  } catch (_) {
+    return null;
+  }
+}
+
+// Mark outbound message as sent or failed
+async function updateMessageStatus(uid, convoId, msgId, status) {
+  try {
+    await db
+      .collection('users').doc(uid)
+      .collection('conversations').doc(convoId)
+      .collection('messages').doc(msgId)
+      .update({ status });
+  } catch (_) {}
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Platform senders — called when Flutter writes a pending outbound message
+// ─────────────────────────────────────────────────────────────────────────────
+
+async function sendWhatsApp({ accessToken, phoneNumberId, to, text }) {
+  const res = await axios.post(
+    `https://graph.facebook.com/v19.0/${phoneNumberId}/messages`,
+    {
+      messaging_product: 'whatsapp',
+      recipient_type:    'individual',
+      to,
+      type:              'text',
+      text:              { body: text },
+    },
+    { headers: { Authorization: `Bearer ${accessToken}`, 'Content-Type': 'application/json' } }
+  );
+  return res.data;
+}
+
+async function sendInstagram({ accessToken, igAccountId, to, text }) {
+  const res = await axios.post(
+    `https://graph.facebook.com/v19.0/${igAccountId}/messages`,
+    {
+      recipient: { id: to },
+      message:   { text },
+    },
+    { headers: { Authorization: `Bearer ${accessToken}`, 'Content-Type': 'application/json' } }
+  );
+  return res.data;
+}
+
+async function sendMessenger({ accessToken, to, text }) {
+  const res = await axios.post(
+    `https://graph.facebook.com/v19.0/me/messages`,
+    {
+      recipient: { id: to },
+      message:   { text },
+    },
+    { headers: { Authorization: `Bearer ${accessToken}`, 'Content-Type': 'application/json' } }
+  );
+  return res.data;
+}
+
+async function sendTelegram({ botToken, chatId, text }) {
+  const res = await axios.post(
+    `https://api.telegram.org/bot${botToken}/sendMessage`,
+    { chat_id: chatId, text, parse_mode: 'HTML' }
+  );
+  return res.data;
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Outbound reply dispatcher
+// Called by POST /messaging/send — Flutter triggers this after writing to Firestore
+// ─────────────────────────────────────────────────────────────────────────────
+app.post('/messaging/send', async (req, res) => {
+  const { uid, conversationId, messageId, channel, contactId, text } = req.body;
+
+  if (!uid || !conversationId || !channel || !contactId || !text) {
+    return res.status(400).json({ error: 'Missing required fields' });
+  }
+
+  try {
+    const creds = await getChannelCreds(uid, channel);
+    if (!creds) {
+      return res.status(404).json({ error: `No credentials found for ${channel}` });
+    }
+
+    switch (channel) {
+      case 'whatsapp':
+        await sendWhatsApp({
+          accessToken:   creds.accessToken,
+          phoneNumberId: creds.phoneNumberId,
+          to:            contactId,
+          text,
+        });
+        break;
+
+      case 'instagram':
+        await sendInstagram({
+          accessToken: creds.accessToken,
+          igAccountId: creds.igAccountId,
+          to:          contactId,
+          text,
+        });
+        break;
+
+      case 'messenger':
+        await sendMessenger({
+          accessToken: creds.accessToken,
+          to:          contactId,
+          text,
+        });
+        break;
+
+      case 'telegram':
+        await sendTelegram({
+          botToken: creds.botToken,
+          chatId:   contactId,
+          text,
+        });
+        break;
+
+      default:
+        return res.status(400).json({ error: `Unknown channel: ${channel}` });
+    }
+
+    // Mark message as sent in Firestore
+    if (messageId) {
+      await updateMessageStatus(uid, conversationId, messageId, 'sent');
+    }
+
+    console.log(`[messaging] Sent ${channel} reply to ${contactId} for uid ${uid}`);
+    return res.status(200).json({ ok: true });
+
+  } catch (err) {
+    console.error(`[messaging/send] ${channel} error:`, err.response?.data || err.message);
+    if (messageId) {
+      await updateMessageStatus(uid, conversationId, messageId, 'failed');
+    }
+    return res.status(500).json({ error: err.response?.data?.error?.message || err.message });
+  }
+});
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Channel connect — saves reverse-lookup index so webhooks can route to uid
+// Called by Flutter after user saves credentials
+// ─────────────────────────────────────────────────────────────────────────────
+app.post('/messaging/connect', async (req, res) => {
+  const { uid, channelType, accountId } = req.body;
+  if (!uid || !channelType || !accountId) {
+    return res.status(400).json({ error: 'Missing uid, channelType or accountId' });
+  }
+  try {
+    await db.collection('appConfig').doc('channelIndex').set(
+      { [`${channelType}_${accountId}`]: uid },
+      { merge: true }
+    );
+    res.json({ ok: true });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// ─────────────────────────────────────────────────────────────────────────────
+// META WEBHOOK VERIFICATION (GET) — WhatsApp + Instagram + Messenger share this
+// ─────────────────────────────────────────────────────────────────────────────
+function metaVerify(req, res) {
+  const mode      = req.query['hub.mode'];
+  const token     = req.query['hub.verify_token'];
+  const challenge = req.query['hub.challenge'];
+  if (mode === 'subscribe' && token === META_VERIFY_TOKEN) {
+    console.log('[webhook] Meta verification success');
+    return res.status(200).send(challenge);
+  }
+  return res.sendStatus(403);
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// WhatsApp Webhook
+// ─────────────────────────────────────────────────────────────────────────────
+app.get('/webhook/whatsapp', metaVerify);
+
+app.post('/webhook/whatsapp', async (req, res) => {
+  res.sendStatus(200); // Always respond 200 immediately to Meta
+  try {
+    const body = req.body;
+    if (body.object !== 'whatsapp_business_account') return;
+
+    for (const entry of body.entry || []) {
+      for (const change of entry.changes || []) {
+        const value = change.value;
+        if (!value?.messages?.length) continue;
+
+        const phoneNumberId = value.metadata?.phone_number_id;
+        const uid = await findUidForChannel('whatsapp', phoneNumberId);
+        if (!uid) { console.warn('[whatsapp] No uid for phoneNumberId', phoneNumberId); continue; }
+
+        for (const msg of value.messages) {
+          const contactId   = msg.from; // sender's phone number
+          const contactName = value.contacts?.find(c => c.wa_id === msg.from)?.profile?.name || msg.from;
+          const text        = msg.text?.body || msg.caption || '';
+          const mediaUrl    = msg.image?.id || msg.document?.id || msg.audio?.id || null;
+
+          await saveIncomingMessage({ uid, channel: 'whatsapp', contactId, contactName, text, mediaUrl });
+        }
+      }
+    }
+  } catch (err) {
+    console.error('[webhook/whatsapp]', err.message);
+  }
+});
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Instagram Webhook
+// ─────────────────────────────────────────────────────────────────────────────
+app.get('/webhook/instagram', metaVerify);
+
+app.post('/webhook/instagram', async (req, res) => {
+  res.sendStatus(200);
+  try {
+    const body = req.body;
+    if (body.object !== 'instagram') return;
+
+    for (const entry of body.entry || []) {
+      const igAccountId = entry.id;
+      const uid = await findUidForChannel('instagram', igAccountId);
+      if (!uid) { console.warn('[instagram] No uid for igAccountId', igAccountId); continue; }
+
+      for (const msg of entry.messaging || []) {
+        if (msg.message?.is_echo) continue; // skip our own sent messages
+        const contactId   = msg.sender?.id;
+        const text        = msg.message?.text || '';
+        const mediaUrl    = msg.message?.attachments?.[0]?.payload?.url || null;
+
+        await saveIncomingMessage({ uid, channel: 'instagram', contactId, contactName: contactId, text, mediaUrl });
+      }
+    }
+  } catch (err) {
+    console.error('[webhook/instagram]', err.message);
+  }
+});
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Messenger Webhook
+// ─────────────────────────────────────────────────────────────────────────────
+app.get('/webhook/messenger', metaVerify);
+
+app.post('/webhook/messenger', async (req, res) => {
+  res.sendStatus(200);
+  try {
+    const body = req.body;
+    if (body.object !== 'page') return;
+
+    for (const entry of body.entry || []) {
+      const pageId = entry.id;
+      const uid = await findUidForChannel('messenger', pageId);
+      if (!uid) { console.warn('[messenger] No uid for pageId', pageId); continue; }
+
+      for (const msg of entry.messaging || []) {
+        if (msg.message?.is_echo) continue;
+        const contactId = msg.sender?.id;
+        const text      = msg.message?.text || '';
+        const mediaUrl  = msg.message?.attachments?.[0]?.payload?.url || null;
+
+        await saveIncomingMessage({ uid, channel: 'messenger', contactId, contactName: contactId, text, mediaUrl });
+      }
+    }
+  } catch (err) {
+    console.error('[webhook/messenger]', err.message);
+  }
+});
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Telegram Webhook
+// Telegram sends to: POST /webhook/telegram/<botToken>
+// Using token in URL path as a security measure (Telegram best practice)
+// ─────────────────────────────────────────────────────────────────────────────
+app.post('/webhook/telegram/:token', async (req, res) => {
+  res.sendStatus(200);
+  try {
+    const { token } = req.params;
+    const update    = req.body;
+    const msg       = update.message || update.edited_message || update.channel_post;
+    if (!msg) return;
+
+    // Find uid by matching bot token stored in connectedChannels
+    // We index as telegram_<botUsername>
+    const botInfo   = await axios.get(`https://api.telegram.org/bot${token}/getMe`);
+    const botUsername = botInfo.data?.result?.username;
+    const uid       = await findUidForChannel('telegram', botUsername);
+    if (!uid) { console.warn('[telegram] No uid for bot', botUsername); return; }
+
+    const contactId   = String(msg.chat?.id);
+    const contactName = msg.chat?.first_name
+      ? `${msg.chat.first_name} ${msg.chat.last_name || ''}`.trim()
+      : msg.chat?.username || contactId;
+    const text      = msg.text || msg.caption || '';
+    const mediaUrl  = msg.photo ? msg.photo[msg.photo.length - 1]?.file_id : null;
+
+    await saveIncomingMessage({ uid, channel: 'telegram', contactId, contactName, text, mediaUrl });
+  } catch (err) {
+    console.error('[webhook/telegram]', err.message);
+  }
+});
+
+// =============================================================================
+// PUSH NOTIFICATIONS — FCM Broadcast
+// POST /notifications/broadcast   — send to all users or specific plan
+// POST /notifications/send-to-user — send to one user by uid
+// GET  /api/notifications/log     — fetch broadcast history for admin panel
+// =============================================================================
+
+app.get('/api/notifications/log', async (req, res) => {
+  try {
+    const snap = await db.collection('notifications_log')
+      .orderBy('sentAt', 'desc').limit(50).get();
+    const logs = snap.docs.map(d => ({ id: d.id, ...d.data() }));
+    res.json({ logs });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+app.post('/notifications/broadcast', async (req, res) => {
+  const { title, body, type = 'broadcast', targetPlan, data = {} } = req.body;
+  if (!title || !body) return res.status(400).json({ error: 'title and body required' });
+
+  try {
+    let query = db.collection('users').where('fcmTokens', '!=', null);
+    if (targetPlan && targetPlan !== 'all') {
+      query = query.where('plan', '==', targetPlan);
+    }
+    const snap   = await query.get();
+    const tokens = [];
+    snap.forEach(doc => {
+      const t = doc.data().fcmTokens;
+      if (Array.isArray(t)) tokens.push(...t);
+    });
+
+    if (tokens.length === 0) return res.json({ ok: true, sent: 0 });
+
+    // Send in batches of 500 (FCM limit)
+    const chunks = [];
+    for (let i = 0; i < tokens.length; i += 500) chunks.push(tokens.slice(i, i + 500));
+
+    let sent = 0;
+    for (const chunk of chunks) {
+      const result = await admin.messaging().sendEachForMulticast({
+        tokens: chunk,
+        notification: { title, body },
+        data: { type, ...Object.fromEntries(Object.entries(data).map(([k, v]) => [k, String(v)])) },
+        android: { priority: 'high', notification: { color: '#C8A96E', sound: 'default' } },
+        apns:    { payload: { aps: { sound: 'default', badge: 1 } } },
+      });
+      sent += result.successCount;
+    }
+
+    await db.collection('notifications_log').add({
+      title, body, type, targetPlan: targetPlan || 'all',
+      totalSent: sent, sentAt: admin.firestore.FieldValue.serverTimestamp(),
+    });
+
+    console.log(`[notifications] Broadcast sent to ${sent} devices`);
+    res.json({ ok: true, sent, total: tokens.length });
+  } catch (err) {
+    console.error('[notifications/broadcast]', err.message);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+app.post('/notifications/send-to-user', async (req, res) => {
+  const { uid, title, body, type = 'system', data = {} } = req.body;
+  if (!uid || !title || !body) return res.status(400).json({ error: 'uid, title and body required' });
+
+  try {
+    const snap   = await db.collection('users').doc(uid).get();
+    if (!snap.exists) return res.status(404).json({ error: 'User not found' });
+
+    const tokens = snap.data().fcmTokens || [];
+    if (tokens.length === 0) return res.json({ ok: true, sent: 0 });
+
+    const result = await admin.messaging().sendEachForMulticast({
+      tokens,
+      notification: { title, body },
+      data: { type, ...Object.fromEntries(Object.entries(data).map(([k, v]) => [k, String(v)])) },
+      android: { priority: 'high', notification: { color: '#C8A96E', sound: 'default' } },
+      apns:    { payload: { aps: { sound: 'default', badge: 1 } } },
+    });
+
+    res.json({ ok: true, sent: result.successCount });
+  } catch (err) {
+    console.error('[notifications/send-to-user]', err.message);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// =============================================================================
 // Start server
-// ─────────────────────────────────────────────────────────────────────────────
+// =============================================================================
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => {
   console.log(`\n✅  Astric Payment Server listening on port ${PORT}`);
