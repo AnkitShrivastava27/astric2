@@ -103,7 +103,10 @@ const EMAILJS_PUBLIC_KEY  = process.env.EMAILJS_PUBLIC_KEY  || '';
 // -----------------------------------------------------------------------------
 // DeepSeek / AI config
 // -----------------------------------------------------------------------------
-const DEEPSEEK_API_KEY = process.env.DEEPSEEK_API_KEY || '';
+const DEEPSEEK_API_KEY  = process.env.DEEPSEEK_API_KEY  || '';
+const GROK_API_KEY      = process.env.GROK_API_KEY      || '';
+const OPENAI_API_KEY    = process.env.OPENAI_API_KEY    || '';
+const ANTHROPIC_API_KEY = process.env.ANTHROPIC_API_KEY || '';
 
 // Default AI token limits per plan (overridden by Firestore ai_limits/config)
 const DEFAULT_AI_LIMITS = {
@@ -1052,7 +1055,10 @@ app.get('/config', async (_, res) => {
         templateId: EMAILJS_TEMPLATE_ID,
         publicKey:  EMAILJS_PUBLIC_KEY,
       },
-      deepseekApiKey: DEEPSEEK_API_KEY,
+      deepseekApiKey:  DEEPSEEK_API_KEY,
+      grokApiKey:      GROK_API_KEY,
+      openaiApiKey:    OPENAI_API_KEY,
+      anthropicApiKey: ANTHROPIC_API_KEY,
       cashfreeEnv:    CF_ENV,
       paypalEnv:      PP_ENV,
       aiLimits: {
@@ -1669,5 +1675,8 @@ app.listen(PORT, () => {
   console.log(`    Server URL  : ${SERVER_BASE_URL}`);
   console.log(`    Firebase    : ${process.env.FIREBASE_PROJECT_ID}`);
   console.log(`    EmailJS     : serviceId=${EMAILJS_SERVICE_ID || '(not set)'}`);
-  console.log(`    DeepSeek    : key_set=${DEEPSEEK_API_KEY.length > 0}\n`);
+  console.log(`    DeepSeek    : key_set=${DEEPSEEK_API_KEY.length > 0}`);
+  console.log(`    Grok (xAI)  : key_set=${GROK_API_KEY.length > 0}`);
+  console.log(`    OpenAI      : key_set=${OPENAI_API_KEY.length > 0}`);
+  console.log(`    Anthropic   : key_set=${ANTHROPIC_API_KEY.length > 0}\n`);
 });
