@@ -1575,7 +1575,160 @@ app.post('/webhook/telegram/:token', async (req, res) => {
 
 // =============================================================================
 // PUSH NOTIFICATIONS — FCM Broadcast
-// POST /notifications/broadcast   — send to all users or specific plan
+// =============================================================================
+// REFERRAL SYSTEM
+// =============================================================================
+// Config lives in Firestore: config/referral
+//   { pointsPerReferral: 100, pointsPerToken: 50, enabled: true }
+//
+// User fields in users/{uid}:
+//   referralCode, referralPoints, referralCount, referredBy
+//
+// Referral records: referrals/{auto-id}
+//   { referrerUid, refereeUid, refereeEmail, pointsAwarded, createdAt }
+// =============================================================================
+
+const _getReferralConfig = async () => {
+  try {
+    const doc = await db.collection('config').doc('referral').get();
+    if (!doc.exists) return { pointsPerReferral: 100, pointsPerToken: 50, enabled: true };
+    return doc.data();
+  } catch (_) {
+    return { pointsPerReferral: 100, pointsPerToken: 50, enabled: true };
+  }
+};
+
+// POST /referral/apply — referee calls this after signup
+// Body: { code, refereeUid, refereeEmail }
+app.post('/referral/apply', async (req, res) => {
+  const { code, refereeUid, refereeEmail } = req.body;
+  if (!code || !refereeUid) return res.status(400).json({ error: 'Missing code or refereeUid' });
+
+  try {
+    const cfg = await _getReferralConfig();
+    if (!cfg.enabled) return res.status(400).json({ error: 'Referral system is currently disabled.' });
+
+    // Find referrer by code
+    const snap = await db.collection('users').where('referralCode', '==', code.trim().toUpperCase()).limit(1).get();
+    if (snap.empty) return res.status(400).json({ error: 'Invalid referral code.' });
+
+    const referrerDoc = snap.docs[0];
+    const referrerUid = referrerDoc.id;
+
+    // Self-referral guard
+    if (referrerUid === refereeUid) return res.status(400).json({ error: 'You cannot use your own referral code.' });
+
+    // Check referee hasn't already used a code
+    const refereeDoc = await db.collection('users').doc(refereeUid).get();
+    if (!refereeDoc.exists) return res.status(400).json({ error: 'Referee not found.' });
+    if (refereeDoc.data().referredBy) return res.status(400).json({ error: 'You have already used a referral code.' });
+
+    const pts = cfg.pointsPerReferral || 100;
+
+    // Write referral record
+    await db.collection('referrals').add({
+      referrerUid,
+      refereeUid,
+      refereeEmail: refereeEmail || '',
+      pointsAwarded: pts,
+      createdAt: admin.firestore.FieldValue.serverTimestamp(),
+    });
+
+    // Award points to referrer + increment count
+    await db.collection('users').doc(referrerUid).update({
+      referralPoints: admin.firestore.FieldValue.increment(pts),
+      referralCount:  admin.firestore.FieldValue.increment(1),
+    });
+
+    // Mark referee as referred
+    await db.collection('users').doc(refereeUid).update({
+      referredBy: code.trim().toUpperCase(),
+    });
+
+    console.log(`[referral] ${refereeUid} used code ${code} → referrer ${referrerUid} earned ${pts} pts`);
+    return res.status(200).json({ success: true, pointsAwarded: pts });
+
+  } catch (err) {
+    console.error('[referral/apply]', err.message);
+    return res.status(500).json({ error: 'Server error applying referral.' });
+  }
+});
+
+// POST /referral/redeem — user spends points for tokens
+// Body: { uid }
+app.post('/referral/redeem', async (req, res) => {
+  const { uid } = req.body;
+  if (!uid) return res.status(400).json({ error: 'Missing uid' });
+
+  try {
+    const cfg = await _getReferralConfig();
+    const cost = cfg.pointsPerToken || 50;
+
+    const userRef = db.collection('users').doc(uid);
+    const userDoc = await userRef.get();
+    if (!userDoc.exists) return res.status(404).json({ error: 'User not found.' });
+
+    const currentPoints = userDoc.data().referralPoints || 0;
+    if (currentPoints < cost) {
+      return res.status(400).json({ error: `Not enough points. You have ${currentPoints}, need ${cost}.` });
+    }
+
+    const tokensAdded = 10000;
+
+    // Deduct points and add tokens atomically
+    await db.runTransaction(async (tx) => {
+      const fresh = await tx.get(userRef);
+      const pts   = fresh.data().referralPoints || 0;
+      if (pts < cost) throw new Error('Insufficient points');
+      tx.update(userRef, {
+        referralPoints: admin.firestore.FieldValue.increment(-cost),
+        addonTokens:    admin.firestore.FieldValue.increment(tokensAdded),
+      });
+    });
+
+    console.log(`[referral/redeem] ${uid} spent ${cost} pts → ${tokensAdded} tokens`);
+    return res.status(200).json({ success: true, tokensAdded });
+
+  } catch (err) {
+    console.error('[referral/redeem]', err.message);
+    if (err.message === 'Insufficient points') {
+      return res.status(400).json({ error: 'Insufficient points.' });
+    }
+    return res.status(500).json({ error: 'Redemption failed.' });
+  }
+});
+
+// GET /referral/config — fetch current config (for app startup)
+app.get('/referral/config', async (req, res) => {
+  try {
+    const cfg = await _getReferralConfig();
+    return res.status(200).json(cfg);
+  } catch (err) {
+    return res.status(500).json({ error: 'Could not fetch referral config.' });
+  }
+});
+
+// POST /admin/referral/config — update config (Firestore write, admin panel calls this)
+// Body: { pointsPerReferral, pointsPerToken, enabled }
+app.post('/admin/referral/config', async (req, res) => {
+  const { pointsPerReferral, pointsPerToken, enabled } = req.body;
+  if (pointsPerReferral == null || pointsPerToken == null) {
+    return res.status(400).json({ error: 'Missing fields.' });
+  }
+  try {
+    await db.collection('config').doc('referral').set({
+      pointsPerReferral: parseInt(pointsPerReferral),
+      pointsPerToken:    parseInt(pointsPerToken),
+      enabled:           enabled !== false,
+      updatedAt:         admin.firestore.FieldValue.serverTimestamp(),
+    });
+    console.log('[admin/referral/config] updated:', { pointsPerReferral, pointsPerToken, enabled });
+    return res.status(200).json({ success: true });
+  } catch (err) {
+    console.error('[admin/referral/config]', err.message);
+    return res.status(500).json({ error: 'Save failed.' });
+  }
+});
 // POST /notifications/send-to-user — send to one user by uid
 // GET  /api/notifications/log     — fetch broadcast history for admin panel
 // =============================================================================
