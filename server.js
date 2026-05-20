@@ -1645,6 +1645,42 @@ app.post('/referral/apply', async (req, res) => {
       referredBy: code.trim().toUpperCase(),
     });
 
+    // ── Send FCM push notification to referrer ─────────────────────────────
+    try {
+      const referrerData = referrerDoc.data();
+      const fcmTokens    = referrerData.fcmTokens || [];
+      const displayEmail = refereeEmail
+        ? refereeEmail.split('@')[0]   // show "john" not "john@gmail.com"
+        : 'Someone';
+
+      if (fcmTokens.length > 0) {
+        await admin.messaging().sendEachForMulticast({
+          tokens: fcmTokens,
+          notification: {
+            title: `🎉 You earned ${pts} points!`,
+            body:  `${displayEmail} just joined Λstric using your referral code.`,
+          },
+          data: {
+            type:          'referral_earned',
+            pointsAwarded: String(pts),
+            refereeEmail:  refereeEmail || '',
+            click_action:  'FLUTTER_NOTIFICATION_CLICK',
+          },
+          android: {
+            priority: 'high',
+            notification: { color: '#C8A96E', sound: 'default' },
+          },
+          apns: {
+            payload: { aps: { sound: 'default', badge: 1 } },
+          },
+        });
+        console.log(`[referral] FCM notification sent to referrer ${referrerUid}`);
+      }
+    } catch (fcmErr) {
+      // Non-fatal — don't fail the referral if FCM fails
+      console.warn('[referral] FCM notification failed:', fcmErr.message);
+    }
+
     console.log(`[referral] ${refereeUid} used code ${code} → referrer ${referrerUid} earned ${pts} pts`);
     return res.status(200).json({ success: true, pointsAwarded: pts });
 
