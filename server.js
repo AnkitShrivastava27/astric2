@@ -1545,31 +1545,61 @@ app.post('/webhook/messenger', async (req, res) => {
 // Telegram sends to: POST /webhook/telegram/<botToken>
 // Using token in URL path as a security measure (Telegram best practice)
 // ─────────────────────────────────────────────────────────────────────────────
+
+// Cache bot username per token to avoid a getMe() call on every message.
+// Entries never expire during a server run (bot usernames don't change).
+const _telegramUsernameCache = {};
+
+async function getTelegramBotUsername(token) {
+  if (_telegramUsernameCache[token]) return _telegramUsernameCache[token];
+  const res = await axios.get(`https://api.telegram.org/bot${token}/getMe`);
+  const username = res.data?.result?.username;
+  if (!username) throw new Error('getMe returned no username');
+  _telegramUsernameCache[token] = username;
+  console.log(`[telegram] Cached bot username: @${username}`);
+  return username;
+}
+
 app.post('/webhook/telegram/:token', async (req, res) => {
+  // Respond 200 immediately so Telegram doesn't retry while we process.
+  // All errors are caught below and logged — Telegram doesn't need to know.
   res.sendStatus(200);
   try {
     const { token } = req.params;
     const update    = req.body;
     const msg       = update.message || update.edited_message || update.channel_post;
-    if (!msg) return;
+    if (!msg?.text && !msg?.caption && !msg?.photo) return; // nothing to save
 
-    // Find uid by matching bot token stored in connectedChannels
-    // We index as telegram_<botUsername>
-    const botInfo   = await axios.get(`https://api.telegram.org/bot${token}/getMe`);
-    const botUsername = botInfo.data?.result?.username;
-    const uid       = await findUidForChannel('telegram', botUsername);
-    if (!uid) { console.warn('[telegram] No uid for bot', botUsername); return; }
+    // Resolve bot username → org-owner uid via channelIndex
+    let botUsername;
+    try {
+      botUsername = await getTelegramBotUsername(token);
+    } catch (e) {
+      console.error('[telegram] getMe failed — invalid or revoked token in URL:', e.message);
+      return;
+    }
+
+    const uid = await findUidForChannel('telegram', botUsername);
+    if (!uid) {
+      console.warn(
+        `[telegram] No uid found for bot @${botUsername}. ` +
+        `Check appConfig/channelIndex has key "telegram_${botUsername}". ` +
+        'Did /messaging/connect complete successfully with the bot username (not the token)?'
+      );
+      return;
+    }
 
     const contactId   = String(msg.chat?.id);
     const contactName = msg.chat?.first_name
       ? `${msg.chat.first_name} ${msg.chat.last_name || ''}`.trim()
       : msg.chat?.username || contactId;
-    const text      = msg.text || msg.caption || '';
-    const mediaUrl  = msg.photo ? msg.photo[msg.photo.length - 1]?.file_id : null;
+    const text        = msg.text || msg.caption || '';
+    const mediaUrl    = msg.photo ? msg.photo[msg.photo.length - 1]?.file_id : null;
 
     await saveIncomingMessage({ uid, channel: 'telegram', contactId, contactName, text, mediaUrl });
   } catch (err) {
-    console.error('[webhook/telegram]', err.message);
+    // Log the full error so Render logs show exactly what failed.
+    console.error('[webhook/telegram] Unhandled error:', err.message, err.stack);
   }
 });
 
