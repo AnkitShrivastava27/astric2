@@ -1853,6 +1853,73 @@ app.post('/notifications/send-to-user', async (req, res) => {
   }
 });
 
+// ═════════════════════════════════════════════════════════════════════════════
+// IMAGE GEN LIMITS — paste into server.js before app.listen()
+//
+// Firestore doc:  config/ai_limits
+// Fields:  basic_images, standard_images, premium_images
+//          (plus existing token fields if any)
+//
+// Admin panel writes:  POST /admin/ai/limits  (requires x-admin-key header)
+// Flutter reads:       GET  /config  (your existing endpoint) OR
+//                      GET  /ai/limits  (new lightweight endpoint below)
+// ═════════════════════════════════════════════════════════════════════════════
+
+// GET /ai/limits — Flutter reads image gen limits at startup
+app.get('/ai/limits', async (req, res) => {
+  try {
+    const snap = await db.collection('config').doc('ai_limits').get();
+    const defaults = {
+      basic_images:    3,
+      standard_images: 20,
+      premium_images:  100,
+    };
+    const data = snap.exists ? { ...defaults, ...snap.data() } : defaults;
+    return res.status(200).json(data);
+  } catch (err) {
+    console.error('[GET /ai/limits]', err.message);
+    return res.status(200).json({ basic_images: 3, standard_images: 20, premium_images: 100 });
+  }
+});
+
+// POST /admin/ai/limits — Admin panel saves image gen limits per plan
+// Body: { basic_images, standard_images, premium_images }
+// Headers: { "x-admin-key": "<ADMIN_API_KEY>" }
+app.post('/admin/ai/limits', async (req, res) => {
+  const key = req.headers['x-admin-key'] || req.headers['authorization']?.replace('Bearer ', '');
+  if (!key || key !== process.env.ADMIN_API_KEY) {
+    return res.status(401).json({ error: 'Unauthorized' });
+  }
+
+  const { basic_images, standard_images, premium_images } = req.body;
+
+  if (basic_images == null || standard_images == null || premium_images == null) {
+    return res.status(400).json({ error: 'basic_images, standard_images, premium_images are required' });
+  }
+
+  const b = parseInt(basic_images);
+  const s = parseInt(standard_images);
+  const p = parseInt(premium_images);
+
+  if ([b, s, p].some(v => isNaN(v) || v < 0)) {
+    return res.status(400).json({ error: 'Image limits must be non-negative integers' });
+  }
+
+  try {
+    await db.collection('config').doc('ai_limits').set({
+      basic_images:    b,
+      standard_images: s,
+      premium_images:  p,
+      updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+    }, { merge: true }); // merge:true preserves existing token fields
+
+    console.log(`[admin/ai/limits] basic=${b} standard=${s} premium=${p}`);
+    return res.status(200).json({ success: true, basic_images: b, standard_images: s, premium_images: p });
+  } catch (err) {
+    console.error('[POST /admin/ai/limits]', err.message);
+    return res.status(500).json({ error: 'Failed to save limits' });
+  }
+});
 // =============================================================================
 // Start server
 // =============================================================================
