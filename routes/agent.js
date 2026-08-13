@@ -11,6 +11,13 @@ const {
 } = require('../services/agent');
 const { currentMonthKey, getAiLimitsConfig } = require('../services/ai');
 
+// Reasoning-tier OpenAI models (gpt-5.x, o-series, etc.) reject the
+// classic `max_tokens` param and require `max_completion_tokens` instead.
+// Extend this list/pattern as new reasoning models get added.
+function usesMaxCompletionTokens(modelId) {
+  return /^(gpt-5|o\d)/i.test(modelId || '');
+}
+
 const SYSTEM_PROMPT = `You are a business assistant embedded in a CRM app, operating in Agent Mode.
 You can create leads, customers, tasks, projects, calendar events, and invoices, and assign tasks
 to employees, by calling the provided tools. Only call a tool when the user's message clearly asks
@@ -62,12 +69,15 @@ router.post('/ai/agent', requireAuth, rateLimit({ windowMs: 60_000, max: 20, key
       { role: 'user', content: message },
     ];
 
+    const tokenLimitKey = usesMaxCompletionTokens(modelCfg.modelId)
+      ? 'max_completion_tokens'
+      : 'max_tokens';
     const upstream = await axios.post(modelCfg.providerCfg.url, {
       model: modelCfg.modelId,
       messages,
       tools: TOOLS,
       tool_choice: 'auto',
-      max_tokens: 1024,
+      [tokenLimitKey]: 1024,
       temperature: 0.3,
     }, {
       headers: { Authorization: `Bearer ${modelCfg.providerCfg.key}`, 'Content-Type': 'application/json' },
