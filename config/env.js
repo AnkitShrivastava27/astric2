@@ -37,7 +37,10 @@ module.exports = {
   EMAILJS_SERVICE_ID: process.env.EMAILJS_SERVICE_ID || '',
   EMAILJS_TEMPLATE_ID: process.env.EMAILJS_TEMPLATE_ID || '',
   EMAILJS_PUBLIC_KEY: process.env.EMAILJS_PUBLIC_KEY || '',
-
+  // -- Google OAuth ------------------------------------------------------------
+GOOGLE_WEB_CLIENT_ID: process.env.GOOGLE_WEB_CLIENT_ID || '',
+HUBSPOT_CLIENT_ID: process.env.HUBSPOT_CLIENT_ID || '',
+HUBSPOT_CLIENT_SECRET: process.env.HUBSPOT_CLIENT_SECRET || '',
   // -- AI (all keys stay server-side; client calls /ai/chat & /ai/image) ------
   DEEPSEEK_API_KEY: process.env.DEEPSEEK_API_KEY || '',
   GROK_API_KEY: process.env.GROK_API_KEY || '',

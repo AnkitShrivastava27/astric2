@@ -68,6 +68,9 @@ router.get('/config', rateLimit({ windowMs: 60_000, max: 30, keyFn: r => `config
         publicKey: env.EMAILJS_PUBLIC_KEY,
       },
       cashfreeEnv: env.CF_ENV,
+      googleWebClientId: env.GOOGLE_WEB_CLIENT_ID,
+      hubspotClientId: env.HUBSPOT_CLIENT_ID,
+      hubspotClientSecret: env.HUBSPOT_CLIENT_SECRET,
       paypalEnv: env.PP_ENV,
       aiLimits: {
         basicTokensLimit: limits.basic_tokens_limit,
