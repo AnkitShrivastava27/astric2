@@ -11,6 +11,27 @@ const { requireAuth } = require('../middleware/auth');
 const { rateLimit } = require('../middleware/rateLimit');
 const { SERVER_BASE_URL } = require('../config/env');
 
+// PayPal's top-level `message` field is usually generic/empty for 422s
+// (e.g. "The requested action could not be performed, semantically
+// incorrect, or failed business validation."). The actionable reason is
+// nested in `details[]`. This pulls both out so callers get something
+// useful instead of the generic wrapper text.
+function extractPaypalError(err) {
+  const data = err?.response?.data;
+  if (!data) return err.message || 'PayPal request failed.';
+  const details = Array.isArray(data.details)
+    ? data.details.map(d => d.description || d.issue).filter(Boolean).join('; ')
+    : '';
+  return details ? `${data.message || data.name || 'PayPal error'}: ${details}` : (data.message || err.message);
+}
+
+// PayPal (particularly for India-registered merchant accounts, under
+// RBI/FEMA cross-border rules) rejects orders below a minimum value with
+// this same generic 422 "business validation" error rather than a clear
+// "amount too small" message. Guard against it here so the user gets an
+// understandable error instead of a confusing PayPal-side rejection.
+const MIN_PAYPAL_USD = 1.00;
+
 // ─────────────────────────────────────────────────────────────────────────
 // POST /paypal/create-order   (PayPal plan purchase) — requireAuth
 // ─────────────────────────────────────────────────────────────────────────
@@ -27,6 +48,12 @@ router.post('/paypal/create-order', requireAuth, rateLimit({ windowMs: 60_000, m
     if (!amountINR || amountINR <= 0) return res.status(500).json({ error: 'Could not determine plan price.' });
 
     const amountUSD = await inrToUsd(amountINR);
+    if (amountUSD < MIN_PAYPAL_USD) {
+      return res.status(400).json({
+        error: `Amount too small for PayPal ($${amountUSD.toFixed(2)}). Minimum is $${MIN_PAYPAL_USD.toFixed(2)}. Please use Cashfree instead.`,
+      });
+    }
+
     const token = await getPayPalAccessToken();
     const orderId = `PP_${uid.substring(0, 6)}_${uuidv4().replace(/-/g, '').substring(0, 10)}`.toUpperCase();
 
@@ -61,7 +88,7 @@ router.post('/paypal/create-order', requireAuth, rateLimit({ windowMs: 60_000, m
 
     return res.status(200).json({ paypalOrderId: ppOrderId, internalOrderId: orderId, approveUrl, amountUSD, amountINR, environment: PP_ENV });
   } catch (err) {
-    const msg = err?.response?.data?.message || err.message || 'PayPal order creation failed.';
+    const msg = extractPaypalError(err) || 'PayPal order creation failed.';
     console.error('paypal/create-order error:', err?.response?.data || err.message);
     return res.status(500).json({ error: msg });
   }
@@ -180,6 +207,12 @@ router.post('/paypal/create-token-order', requireAuth, rateLimit({ windowMs: 60_
     const tokenPackPrice = await getTokenPackPrice();
     const amountINR = tokenPackPrice * packs;
     const amountUSD = await inrToUsd(amountINR);
+    if (amountUSD < MIN_PAYPAL_USD) {
+      const minPacks = Math.ceil((MIN_PAYPAL_USD / amountUSD) * packs);
+      return res.status(400).json({
+        error: `Amount too small for PayPal ($${amountUSD.toFixed(2)}). Minimum is $${MIN_PAYPAL_USD.toFixed(2)} — buy at least ${minPacks} pack${minPacks > 1 ? 's' : ''}, or use Cashfree instead.`,
+      });
+    }
 
     const token = await getPayPalAccessToken();
     const orderId = `PPTOK_${uid.substring(0, 6)}_${uuidv4().replace(/-/g, '').substring(0, 8)}`.toUpperCase();
@@ -212,7 +245,7 @@ router.post('/paypal/create-token-order', requireAuth, rateLimit({ windowMs: 60_
 
     return res.status(200).json({ paypalOrderId: ppOrderId, internalOrderId: orderId, approveUrl, amountUSD, amountINR, environment: PP_ENV });
   } catch (err) {
-    const msg = err?.response?.data?.message || err.message || 'PayPal token order failed.';
+    const msg = extractPaypalError(err) || 'PayPal token order failed.';
     console.error('paypal/create-token-order error:', err?.response?.data || err.message);
     return res.status(500).json({ error: msg });
   }
