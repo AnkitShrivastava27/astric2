@@ -63,6 +63,7 @@ app.use(require('./routes/notifications'));
 app.use(require('./routes/integrations'));
 app.use(require('./routes/agent'));
 app.use(require('./routes/ai-website'))
+app.use(require('./routes/website-credits'));
 
 const env = require('./config/env');
 const { CF_BASE_URL } = require('./services/cashfree');
