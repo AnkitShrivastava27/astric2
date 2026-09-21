@@ -30,13 +30,30 @@ if (!admin.apps.length) {
   admin.initializeApp();
 }
 
-// Mirrors WebsiteTier in website_project_model.dart - keep these two in
-// sync if the pricing ever changes.
+// Mirrors WebsiteTier in website_project_model.dart for the FIXED parts
+// (what each tier gets) — these don't change without a product decision.
+// Price is intentionally NOT here: it's read live from pricing_config/plans
+// below, matching the "amount always from Firestore, never trust a
+// hardcoded constant" pattern this app's other Cashfree flows already use
+// (see Pricing.jsx / routes/pricing.js in the admin panel, which write
+// website_trial_price / website_standard_price / website_pro_price into
+// that same doc when an admin updates pricing).
 const TIERS = {
-  trial:    { priceINR: 9,  tokenBudget: 1000 },
-  standard: { priceINR: 39, tokenBudget: 4500 },
-  pro:      { priceINR: 99, tokenBudget: 9000 },
+  trial:    { tokenBudget: 1000, priceField: 'website_trial_price' },
+  standard: { tokenBudget: 4500, priceField: 'website_standard_price' },
+  pro:      { tokenBudget: 9000, priceField: 'website_pro_price' },
 };
+
+// Same doc the rest of this app's pricing already lives in.
+async function getWebsiteTierPriceINR(tierName) {
+  const tier = TIERS[tierName];
+  const snap = await admin.firestore().collection('pricing_config').doc('plans').get();
+  const price = snap.exists ? snap.data()[tier.priceField] : undefined;
+  // Fallback only for local/dev safety if the admin hasn't set a price
+  // yet — production should always have real values here via Pricing.jsx.
+  const fallback = { trial: 9, standard: 39, pro: 99 }[tierName];
+  return typeof price === 'number' ? price : fallback;
+}
 
 // TODO: replace this with your ACTUAL existing Cashfree order-creation
 // call - copy the body of whatever function /create-order or
@@ -78,8 +95,10 @@ router.post('/create-website-credit-order', async (req, res) => {
       return res.status(401).json({ error: 'Not authenticated' });
     }
 
+    const priceINR = await getWebsiteTierPriceINR(tierName);
+
     const order = await createCashfreeOrder({
-      amountINR: tier.priceINR,
+      amountINR: priceINR,
       userEmail: req.body.userEmail,
       userName:  req.body.userName,
       userPhone: req.body.userPhone,
@@ -90,7 +109,7 @@ router.post('/create-website-credit-order', async (req, res) => {
     // amount without trusting anything the client sends back at verify
     // time (the client only ever sends orderId to /verify).
     await admin.firestore().collection('websiteCreditOrders').doc(order.orderId).set({
-      uid: uid, tier: tierName, tokenBudget: tier.tokenBudget, priceINR: tier.priceINR,
+      uid: uid, tier: tierName, tokenBudget: tier.tokenBudget, priceINR: priceINR,
       status: 'CREATED',
       createdAt: admin.firestore.FieldValue.serverTimestamp(),
     });
@@ -98,7 +117,7 @@ router.post('/create-website-credit-order', async (req, res) => {
     return res.json({
       orderId: order.orderId,
       paymentSessionId: order.paymentSessionId,
-      amountINR: tier.priceINR,
+      amountINR: priceINR,
     });
   } catch (err) {
     console.error('POST /create-website-credit-order failed:', err);
