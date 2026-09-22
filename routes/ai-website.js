@@ -1,194 +1,583 @@
 // routes/ai-website.js
 //
-// POST /ai/website - two modes, both returning JSON (not a single HTML
-// blob, per the redesign):
+// POST /ai/website
 //
-//   mode: 'build'
-//     body:   { prompt, maxPages, tokenBudget }
-//     result: { name, pageOrder: [...], files: { "index.html": "...", ... } }
+// Modes:
 //
-//   mode: 'revise'
-//     body:   { prompt, existingFiles: {...}, pageOrder: [...] }
-//     result: { files: { <only the changed/new pages> } }
+//   build
+//     body:
+//     {
+//       mode: "build",
+//       prompt: "...",
+//       maxPages: 4,
+//       tokenBudget: 10000
+//     }
 //
-// The 'revise' mode is the whole point of the "only regenerate what
-// changed" requirement: the model is given every existing page as context
-// and explicitly instructed to return ONLY the pages it actually touched,
-// which is what keeps a follow-up prompt materially cheaper than a full
-// rebuild.
+//     result:
+//     {
+//       name: "...",
+//       pageOrder: ["index.html", "about.html", ...],
+//       files: {
+//         "index.html": "<!DOCTYPE html>...</html>",
+//         ...
+//       }
+//     }
 //
-// SETUP (unchanged from the original version of this file):
-// 1. npm install openai
-// 2. OPENAI_API_KEY env var / secret alongside your other keys
-// 3. Mount in server.js: app.use('/ai', require('./routes/ai-website'));
-// 4. Wire in your EXISTING auth + quota-check middleware - two TODOs below
-//    mark exactly where. This route currently has no auth check of its own.
+//   revise
+//     body:
+//     {
+//       mode: "revise",
+//       prompt: "...",
+//       existingFiles: {...},
+//       pageOrder: [...]
+//     }
+//
+//     result:
+//     {
+//       files: {
+//         "index.html": "<!DOCTYPE html>...</html>"
+//       }
+//     }
 
 const express = require('express');
 const router = express.Router();
 const OpenAI = require('openai');
 
-const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
-//const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
+const openai = new OpenAI({
+  apiKey: process.env.OPENAI_API_KEY,
+});
 
-const WEBSITE_MODEL = process.env.OPENAI_WEBSITE_MODEL || 'gpt-5.4-mini';
-const BUILD_SYSTEM_PROMPT = `You generate complete, polished, multi-page websites as JSON.
+// Uses your Render environment variable if present.
+// Otherwise automatically uses GPT-5.4 Mini.
+const WEBSITE_MODEL =
+  process.env.OPENAI_WEBSITE_MODEL || 'gpt-5.4-mini';
 
-Output JSON matching exactly: {"name": string, "pageOrder": string[], "files": {"<filename>.html": "<full HTML document>"}}
+/* -------------------------------------------------------------------------- */
+/* BUILD PROMPT                                                               */
+/* -------------------------------------------------------------------------- */
 
-Rules:
-- "name": a short 2-4 word site name based on the request (e.g. "Iron Forge Fitness").
-- "pageOrder": filenames in the order they should appear as tabs (e.g. ["index.html","about.html","contact.html"]). Respect the page-count limit given in the user message.
-- Each file's value is ONE complete HTML document: <!DOCTYPE html> through </html>, no markdown fences.
-- All CSS inline in one <style> tag per page (identical <style> content across pages of the same site is fine and expected - keep the design system consistent). All JS inline in <script> tags. No external files except optionally a Google Fonts <link>.
-- Real, specific, on-topic copy (headlines, body text, prices, names) for what the user describes - never lorem ipsum.
-- Genuinely responsive: CSS Grid/Flexbox + media queries, must work from 375px to 1440px+ wide. Not a fixed-width layout.
-- A real, cohesive visual design: considered color palette, real spacing/typography, hover states, at least one subtle flourish (gradient/shadow/transition) - a launchable site, not a wireframe.
-- Images: CSS gradients, SVG, or https://picsum.photos/... placeholders only.
-- Internal links between pages use plain relative hrefs (e.g. href="about.html") even though the preview may render pages one at a time.
-- Be decisive about ambiguous requests - make a single reasonable interpretation and build it, rather than asking a clarifying question back.
-- Do not pad output: no repeated boilerplate comments, no unused CSS, no filler paragraphs added just to look "complete". Write only what the design needs.`;
+const BUILD_SYSTEM_PROMPT = `
+You generate complete, polished, responsive multi-page websites as JSON.
 
-const REVISE_SYSTEM_PROMPT = `You make a targeted edit to an existing multi-page website and return ONLY what changed, as JSON.
+Output JSON matching EXACTLY:
 
-You will be given the site's current pages (as filename -> full HTML) and a change request.
+{
+  "name": "string",
+  "pageOrder": ["index.html", "about.html"],
+  "files": {
+    "index.html": "<full HTML document>",
+    "about.html": "<full HTML document>"
+  }
+}
 
-Output JSON matching exactly: {"files": {"<filename>.html": "<full updated HTML document>"}}
+IMPORTANT OUTPUT LIMITS:
+- Maximum 4 pages.
+- Only create the number of pages actually useful for the request.
+- Prefer 3-4 pages for a normal business website.
+- Do not create unnecessary pages.
+- Each page must be a complete HTML document.
+- Keep each HTML page reasonably compact.
+- Do not repeat unnecessarily large sections of CSS or JavaScript.
+- Do not add huge amounts of text merely to increase content.
+- Do not create massive SVGs.
+- Do not embed base64 images.
+- Do not generate enormous JavaScript libraries.
 
-Rules:
-- Include ONLY pages you actually changed, plus any brand-new page the request requires. Do NOT include unchanged pages in the output - this is the single most important rule; omitting untouched pages is what keeps revisions cheap.
-- Each included file's value is the COMPLETE updated HTML document (not a diff/patch) - full <!DOCTYPE html> through </html>.
-- Preserve the site's existing visual language (colors, fonts, layout system) in anything you touch unless the request specifically asks to change the design.
-- Same technical constraints as the original build: inline CSS/JS only, no external files except optional Google Fonts, genuinely responsive, real copy not placeholders.
-- Be decisive about ambiguous requests rather than asking a clarifying question back.`;
+RULES:
+
+1. "name"
+- Short 2-4 word website name.
+- Based on the user's request.
+
+2. "pageOrder"
+- Contains the HTML filenames in navigation order.
+- Example:
+  ["index.html", "about.html", "services.html", "contact.html"]
+
+3. HTML
+- Every file must be a complete document:
+  <!DOCTYPE html>
+  ...
+  </html>
+- No Markdown code fences.
+- No explanations outside the JSON.
+
+4. CSS
+- CSS must be inside a <style> tag.
+- Use modern CSS.
+- Use Flexbox and/or Grid.
+- Must be responsive.
+- Support approximately 375px through 1440px+.
+- Include mobile media queries.
+- Use a cohesive visual system.
+- Include hover states and subtle transitions.
+- Avoid unnecessary CSS.
+
+5. JavaScript
+- JavaScript must be inside <script> tags.
+- Only add JavaScript when useful.
+- Do not include external JavaScript libraries.
+
+6. Images
+- Do not use base64 images.
+- Do not embed binary image data.
+- You may use:
+  - CSS gradients
+  - inline SVG
+  - https://picsum.photos/... placeholders
+- Keep SVG reasonably small.
+
+7. Content
+- Use realistic, specific content based on the request.
+- Never use lorem ipsum.
+- Do not create excessively long paragraphs.
+- Keep the copy concise and useful.
+
+8. Navigation
+- Internal links must use relative HTML filenames.
+- Example:
+  href="about.html"
+  href="contact.html"
+
+9. Design
+- Produce a real polished website.
+- Use appropriate spacing.
+- Use a professional typography hierarchy.
+- Use cards/sections where appropriate.
+- Include responsive navigation.
+- Make reasonable decisions without asking questions.
+
+10. JSON
+- Return VALID JSON only.
+- No Markdown fences.
+- No comments outside JSON.
+`;
+
+/* -------------------------------------------------------------------------- */
+/* REVISE PROMPT                                                              */
+/* -------------------------------------------------------------------------- */
+
+const REVISE_SYSTEM_PROMPT = `
+You make targeted edits to an existing multi-page website.
+
+You will receive:
+1. The existing HTML files.
+2. A change request.
+
+Return ONLY the files that actually changed.
+
+Output JSON EXACTLY:
+
+{
+  "files": {
+    "filename.html": "<complete updated HTML document>"
+  }
+}
+
+RULES:
+
+1. Only return changed/new pages.
+2. Do not return unchanged pages.
+3. Every returned page must be a COMPLETE HTML document.
+4. Preserve the existing visual language unless the user asks to change it.
+5. Keep CSS and JavaScript compact.
+6. Do not add unnecessary content.
+7. Do not embed base64 images.
+8. Do not generate huge SVGs.
+9. Keep the site responsive.
+10. Return valid JSON only.
+11. No Markdown fences.
+12. No explanations outside JSON.
+`;
+
+/* -------------------------------------------------------------------------- */
+/* JSON CLEANUP                                                               */
+/* -------------------------------------------------------------------------- */
 
 function stripJsonFences(text) {
-  let t = text.trim();
-  if (t.startsWith('```')) {
-    t = t.replace(/^```(?:json)?\n?/, '').replace(/```$/, '').trim();
+  if (!text) {
+    return '';
   }
-  return t;
+
+  let result = String(text).trim();
+
+  if (result.startsWith('```')) {
+    result = result
+      .replace(/^```(?:json)?\s*/i, '')
+      .replace(/\s*```$/i, '')
+      .trim();
+  }
+
+  return result;
 }
+
+/* -------------------------------------------------------------------------- */
+/* BASIC VALIDATION                                                           */
+/* -------------------------------------------------------------------------- */
+
+function validateFiles(files) {
+  if (!files || typeof files !== 'object') {
+    return false;
+  }
+
+  const keys = Object.keys(files);
+
+  if (keys.length === 0) {
+    return false;
+  }
+
+  for (const filename of keys) {
+    if (!filename.toLowerCase().endsWith('.html')) {
+      continue;
+    }
+
+    const html = files[filename];
+
+    if (typeof html !== 'string') {
+      return false;
+    }
+
+    if (!html.toLowerCase().includes('<!doctype html>')) {
+      return false;
+    }
+
+    if (!html.toLowerCase().includes('</html>')) {
+      return false;
+    }
+  }
+
+  return true;
+}
+
+/* -------------------------------------------------------------------------- */
+/* ROUTE                                                                      */
+/* -------------------------------------------------------------------------- */
 
 router.post('/website', async (req, res) => {
   try {
-    // TODO: verify the Firebase ID token the same way your other /ai/*
-    // routes do - this endpoint currently has no auth check of its own.
-    // const uid = await verifyFirebaseToken(req);
-
-    // TODO: your existing per-user AI quota check could still gate here
-    // as a hard ceiling, in addition to the Website Studio credit system
-    // the Flutter app already enforces client+Firestore-side. Respond
-    // with HTTP 402 on exhaustion - the Flutter side already expects that
-    // to mean "quota exceeded".
-
     const mode = req.body && req.body.mode;
+
     if (mode !== 'build' && mode !== 'revise') {
-      return res.status(400).json({ error: { message: "mode must be 'build' or 'revise'" } });
+      return res.status(400).json({
+        error: {
+          message: "mode must be 'build' or 'revise'",
+        },
+      });
     }
 
     const prompt = ((req.body && req.body.prompt) || '').trim();
+
     if (!prompt) {
-      return res.status(400).json({ error: { message: 'prompt is required' } });
+      return res.status(400).json({
+        error: {
+          message: 'prompt is required',
+        },
+      });
     }
 
     let messages;
     let maxTokens;
 
+    /* ---------------------------------------------------------------------- */
+    /* BUILD                                                                   */
+    /* ---------------------------------------------------------------------- */
+
     if (mode === 'build') {
-      const maxPages = Math.max(1, Math.min(12, Number(req.body && req.body.maxPages) || 4));
-      const tokenBudget = Number(req.body && req.body.tokenBudget) || 12000;
-      maxTokens = Math.min(30000, Math.max(6000, tokenBudget * 2));
+      // Website Studio intentionally limits a single build to 4 pages.
+      // This prevents giant JSON responses and truncated HTML.
+      const requestedPages = Number(
+        req.body && req.body.maxPages
+      ) || 4;
+
+      const maxPages = Math.max(
+        1,
+        Math.min(4, requestedPages)
+      );
+
+      // Default 10k budget.
+      // Maximum completion allowance is 30k.
+      const tokenBudget =
+        Number(req.body && req.body.tokenBudget) || 10000;
+
+      maxTokens = Math.min(
+        30000,
+        Math.max(8000, tokenBudget * 2)
+      );
 
       messages = [
-        { role: 'system', content: BUILD_SYSTEM_PROMPT },
-        { role: 'user', content: `Build this website (max ${maxPages} pages): ${prompt}` },
-      ];
-    } else {
-      const existingFiles = req.body && req.body.existingFiles;
-      if (!existingFiles || typeof existingFiles !== 'object' || Object.keys(existingFiles).length === 0) {
-        return res.status(400).json({ error: { message: 'existingFiles is required for revise mode' } });
-      }
-      maxTokens = 6000;
-
-      messages = [
-        { role: 'system', content: REVISE_SYSTEM_PROMPT },
+        {
+          role: 'system',
+          content: BUILD_SYSTEM_PROMPT,
+        },
         {
           role: 'user',
-          content: `Current site pages:\n${JSON.stringify(existingFiles)}\n\nChange requested: ${prompt}`,
+          content:
+            `Build this website with a maximum of ${maxPages} pages.\n\n` +
+            `User request:\n${prompt}`,
         },
       ];
     }
 
-   const completion = await openai.chat.completions.create({
-  model: WEBSITE_MODEL,
-  temperature: 0.7,
-  max_completion_tokens: maxTokens,
-  response_format: { type: 'json_object' },
-  messages,
-});
+    /* ---------------------------------------------------------------------- */
+    /* REVISE                                                                  */
+    /* ---------------------------------------------------------------------- */
 
-  const raw =
-  (completion.choices[0] &&
-    completion.choices[0].message &&
-    completion.choices[0].message.content) ||
-  '';
+    else {
+      const existingFiles =
+        req.body && req.body.existingFiles;
 
-console.log(
-  'Website Studio OpenAI response:',
-  JSON.stringify({
-    model: WEBSITE_MODEL,
-    finish_reason: completion.choices[0]?.finish_reason,
-    response_length: raw.length,
-  })
-);
+      const pageOrder =
+        req.body && req.body.pageOrder;
 
-if (!raw.trim()) {
-  console.error('Website Studio: OpenAI returned an empty response.');
+      if (
+        !existingFiles ||
+        typeof existingFiles !== 'object' ||
+        Object.keys(existingFiles).length === 0
+      ) {
+        return res.status(400).json({
+          error: {
+            message:
+              'existingFiles is required for revise mode',
+          },
+        });
+      }
 
-  return res.status(502).json({
-    error: {
-      message: 'The AI returned an empty response. Please try again.',
-    },
-  });
-}
+      // Revisions normally affect one or two pages.
+      // 16k is enough for a targeted revision while avoiding
+      // unnecessarily huge responses.
+      maxTokens = 16000;
 
-let parsed;
+      messages = [
+        {
+          role: 'system',
+          content: REVISE_SYSTEM_PROMPT,
+        },
+        {
+          role: 'user',
+          content:
+            `Current page order:\n${JSON.stringify(pageOrder || [])}\n\n` +
+            `Current site files:\n${JSON.stringify(existingFiles)}\n\n` +
+            `Change requested:\n${prompt}`,
+        },
+      ];
+    }
 
-try {
-  parsed = JSON.parse(stripJsonFences(raw));
-} catch (e) {
-  console.error(
-    'Website Studio: invalid JSON from OpenAI.',
-    'finish_reason:',
-    completion.choices[0]?.finish_reason,
-    'raw:',
-    raw.slice(0, 2000)
-  );
+    /* ---------------------------------------------------------------------- */
+    /* OPENAI REQUEST                                                          */
+    /* ---------------------------------------------------------------------- */
 
-  return res.status(502).json({
-    error: {
-      message:
-        completion.choices[0]?.finish_reason === 'length'
-          ? 'The AI response was too large. Please try a shorter website request.'
-          : 'The AI returned an invalid website response. Please try again.',
-    },
-  });
-}
+    console.log('Website Studio request:', {
+      mode,
+      model: WEBSITE_MODEL,
+      maxTokens,
+      promptLength: prompt.length,
+    });
+
+    const completion =
+      await openai.chat.completions.create({
+        model: WEBSITE_MODEL,
+
+        // GPT-5.4 Mini should be allowed to focus on
+        // generating the requested HTML.
+        temperature: 0.7,
+
+        max_completion_tokens: maxTokens,
+
+        response_format: {
+          type: 'json_object',
+        },
+
+        messages,
+      });
+
+    /* ---------------------------------------------------------------------- */
+    /* RESPONSE INFORMATION                                                    */
+    /* ---------------------------------------------------------------------- */
+
+    const choice =
+      completion.choices &&
+      completion.choices.length > 0
+        ? completion.choices[0]
+        : null;
+
+    const raw =
+      choice &&
+      choice.message &&
+      typeof choice.message.content === 'string'
+        ? choice.message.content
+        : '';
+
+    console.log(
+      'Website Studio OpenAI response:',
+      JSON.stringify({
+        model: WEBSITE_MODEL,
+        finish_reason: choice
+          ? choice.finish_reason
+          : null,
+        response_length: raw.length,
+        usage: completion.usage || null,
+      })
+    );
+
+    /* ---------------------------------------------------------------------- */
+    /* EMPTY RESPONSE                                                          */
+    /* ---------------------------------------------------------------------- */
+
+    if (!raw.trim()) {
+      console.error(
+        'Website Studio: OpenAI returned an empty response.'
+      );
+
+      return res.status(502).json({
+        error: {
+          message:
+            'The AI returned an empty response. Please try again.',
+        },
+      });
+    }
+
+    /* ---------------------------------------------------------------------- */
+    /* TRUNCATED RESPONSE                                                      */
+    /* ---------------------------------------------------------------------- */
+
+    if (choice && choice.finish_reason === 'length') {
+      console.error(
+        'Website Studio: response reached the completion limit.'
+      );
+
+      return res.status(502).json({
+        error: {
+          message:
+            'The AI response was too large. Please try a shorter website request or fewer pages.',
+          code: 'RESPONSE_TOO_LARGE',
+        },
+      });
+    }
+
+    /* ---------------------------------------------------------------------- */
+    /* JSON PARSING                                                            */
+    /* ---------------------------------------------------------------------- */
+
+    let parsed;
+
+    try {
+      const cleaned = stripJsonFences(raw);
+      parsed = JSON.parse(cleaned);
+    } catch (error) {
+      console.error(
+        'Website Studio: invalid JSON from OpenAI.',
+        {
+          finish_reason: choice
+            ? choice.finish_reason
+            : null,
+          response_length: raw.length,
+          raw: raw.slice(0, 3000),
+        }
+      );
+
+      return res.status(502).json({
+        error: {
+          message:
+            'The AI returned an invalid website response. Please try again.',
+          code: 'INVALID_AI_JSON',
+        },
+      });
+    }
+
+    /* ---------------------------------------------------------------------- */
+    /* BUILD RESPONSE                                                          */
+    /* ---------------------------------------------------------------------- */
 
     if (mode === 'build') {
+      if (!validateFiles(parsed.files)) {
+        console.error(
+          'Website Studio: build response did not contain valid files.'
+        );
+
+        return res.status(502).json({
+          error: {
+            message:
+              'The AI did not return valid website files. Please try again.',
+            code: 'INVALID_WEBSITE_FILES',
+          },
+        });
+      }
+
+      let pageOrder;
+
+      if (Array.isArray(parsed.pageOrder)) {
+        pageOrder = parsed.pageOrder
+          .map((item) => String(item))
+          .filter((item) =>
+            Object.prototype.hasOwnProperty.call(
+              parsed.files,
+              item
+            )
+          );
+      } else {
+        pageOrder = Object.keys(parsed.files);
+      }
+
+      // If the model returned an invalid/empty pageOrder,
+      // fall back to the returned files.
+      if (pageOrder.length === 0) {
+        pageOrder = Object.keys(parsed.files);
+      }
+
       return res.json({
-        name: parsed.name || '',
-        pageOrder: Array.isArray(parsed.pageOrder) ? parsed.pageOrder : Object.keys(parsed.files),
+        name:
+          typeof parsed.name === 'string'
+            ? parsed.name.trim()
+            : '',
+
+        pageOrder,
+
         files: parsed.files,
       });
     }
-    return res.json({ files: parsed.files });
 
+    /* ---------------------------------------------------------------------- */
+    /* REVISE RESPONSE                                                         */
+    /* ---------------------------------------------------------------------- */
+
+    if (!validateFiles(parsed.files)) {
+      console.error(
+        'Website Studio: revision response did not contain valid files.'
+      );
+
+      return res.status(502).json({
+        error: {
+          message:
+            'The AI did not return valid changed files. Please try again.',
+          code: 'INVALID_REVISION_FILES',
+        },
+      });
+    }
+
+    return res.json({
+      files: parsed.files,
+    });
   } catch (err) {
-    console.error('POST /ai/website failed:', err);
-    return res.status(500).json({
-      error: { message: err.message || 'Website generation failed.' },
+    console.error(
+      'POST /ai/website failed:',
+      err
+    );
+
+    const status =
+      err &&
+      err.status &&
+      Number.isInteger(err.status)
+        ? err.status
+        : 500;
+
+    return res.status(status).json({
+      error: {
+        message:
+          err &&
+          err.message
+            ? err.message
+            : 'Website generation failed.',
+      },
     });
   }
 });
