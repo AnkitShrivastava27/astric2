@@ -29,7 +29,9 @@ const router = express.Router();
 const OpenAI = require('openai');
 
 const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
+//const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
 
+const WEBSITE_MODEL = process.env.OPENAI_WEBSITE_MODEL || 'gpt-5.4-mini';
 const BUILD_SYSTEM_PROMPT = `You generate complete, polished, multi-page websites as JSON.
 
 Output JSON matching exactly: {"name": string, "pageOrder": string[], "files": {"<filename>.html": "<full HTML document>"}}
@@ -118,13 +120,13 @@ router.post('/website', async (req, res) => {
       ];
     }
 
-    const completion = await openai.chat.completions.create({
-      model: 'gpt-5.4-mini',
-      temperature: 0.7,
-      max_completion_tokens: maxTokens,
-      response_format: { type: 'json_object' },
-      messages,
-    });
+   const completion = await openai.chat.completions.create({
+  model: WEBSITE_MODEL,
+  temperature: 0.7,
+  max_completion_tokens: maxTokens,
+  response_format: { type: 'json_object' },
+  messages,
+});
 
   const raw =
   (completion.choices[0] &&
