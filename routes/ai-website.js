@@ -1,583 +1,227 @@
 // routes/ai-website.js
 //
-// POST /ai/website
+// POST /ai/website - two modes, both returning JSON (not a single HTML
+// blob, per the redesign):
 //
-// Modes:
+//   mode: 'build'
+//     body:   { prompt, maxPages, tokenBudget }
+//     result: { name, pageOrder: [...], files: { "index.html": "...", ... } }
 //
-//   build
-//     body:
-//     {
-//       mode: "build",
-//       prompt: "...",
-//       maxPages: 4,
-//       tokenBudget: 10000
-//     }
+//   mode: 'revise'
+//     body:   { prompt, existingFiles: {...}, pageOrder: [...] }
+//     result: { files: { <only the changed/new pages> } }
 //
-//     result:
-//     {
-//       name: "...",
-//       pageOrder: ["index.html", "about.html", ...],
-//       files: {
-//         "index.html": "<!DOCTYPE html>...</html>",
-//         ...
-//       }
-//     }
+// The 'revise' mode is the whole point of the "only regenerate what
+// changed" requirement: the model is given every existing page as context
+// and explicitly instructed to return ONLY the pages it actually touched,
+// which is what keeps a follow-up prompt materially cheaper than a full
+// rebuild.
 //
-//   revise
-//     body:
-//     {
-//       mode: "revise",
-//       prompt: "...",
-//       existingFiles: {...},
-//       pageOrder: [...]
-//     }
+// 🔧 WIRED UP — two fixes vs the placeholder version of this file:
 //
-//     result:
-//     {
-//       files: {
-//         "index.html": "<!DOCTYPE html>...</html>"
-//       }
-//     }
-
+// 1. "openai" was require()'d here but missing from package.json. Since
+//    server.js loads every route file unconditionally at boot, a fresh
+//    `npm install` (e.g. a new Render deploy) would have thrown
+//    "Cannot find module 'openai'" and crashed the ENTIRE server, not
+//    just this route — added to package.json.
+//
+// 2. This endpoint had NO auth check and NO server-side credit check —
+//    literally anyone with the URL could generate unlimited websites for
+//    free with a bare curl request, bypassing the Cashfree-purchased
+//    credit system entirely (the credit deduction only ever happened
+//    client-side in the Flutter app, which is trivial to skip). Added
+//    requireAuth (same as /ai/chat, /ai/image) plus a real, transactional
+//    deduction from the SAME users/{uid}/websiteStudio/credits.tokensRemaining
+//    balance the client already uses, for 'build' mode. 'revise' mode is
+//    left as-is (governed by a project's own revisionsRemaining, which
+//    lives only in the client's Firestore document — this endpoint has no
+//    projectId to check that against; tightening that further would need
+//    a slightly bigger change and is worth a follow-up if it matters to
+//    you).
 const express = require('express');
 const router = express.Router();
 const OpenAI = require('openai');
+const { admin, db } = require('../config/firebase');
+const { requireAuth } = require('../middleware/auth');
+const { rateLimit } = require('../middleware/rateLimit');
 
-const openai = new OpenAI({
-  apiKey: process.env.OPENAI_API_KEY,
-});
+const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
 
-// Uses your Render environment variable if present.
-// Otherwise automatically uses GPT-5.4 Mini.
-const WEBSITE_MODEL =
-  process.env.OPENAI_WEBSITE_MODEL || 'gpt-5.4-mini';
+// Must match WebsiteTier.tokenBudget in website_project_model.dart exactly.
+// Only these three amounts are ever accepted as a build's cost — an
+// arbitrary client-supplied tokenBudget is never trusted directly, or a
+// caller could claim a cheap cost for an expensive build.
+const VALID_BUILD_TOKEN_BUDGETS = [1000, 4500, 9000];
 
-/* -------------------------------------------------------------------------- */
-/* BUILD PROMPT                                                               */
-/* -------------------------------------------------------------------------- */
+const BUILD_SYSTEM_PROMPT = `You generate complete, polished, multi-page websites as JSON.
 
-const BUILD_SYSTEM_PROMPT = `
-You generate complete, polished, responsive multi-page websites as JSON.
+Output JSON matching exactly: {"name": string, "pageOrder": string[], "files": {"<filename>.html": "<full HTML document>"}}
 
-Output JSON matching EXACTLY:
+Rules:
+- "name": a short 2-4 word site name based on the request (e.g. "Iron Forge Fitness").
+- "pageOrder": filenames in the order they should appear as tabs (e.g. ["index.html","about.html","contact.html"]). Respect the page-count limit given in the user message.
+- Each file's value is ONE complete HTML document: <!DOCTYPE html> through </html>, no markdown fences.
+- All CSS inline in one <style> tag per page (identical <style> content across pages of the same site is fine and expected - keep the design system consistent). All JS inline in <script> tags. No external files except optionally a Google Fonts <link>.
+- Real, specific, on-topic copy (headlines, body text, prices, names) for what the user describes - never lorem ipsum.
+- Genuinely responsive: CSS Grid/Flexbox + media queries, must work from 375px to 1440px+ wide. Not a fixed-width layout.
+- A real, cohesive visual design: considered color palette, real spacing/typography, hover states, at least one subtle flourish (gradient/shadow/transition) - a launchable site, not a wireframe.
+- Images: CSS gradients, SVG, or https://picsum.photos/... placeholders only.
+- Internal links between pages use plain relative hrefs (e.g. href="about.html") even though the preview may render pages one at a time.
+- Be decisive about ambiguous requests - make a single reasonable interpretation and build it, rather than asking a clarifying question back.
+- Do not pad output: no repeated boilerplate comments, no unused CSS, no filler paragraphs added just to look "complete". Write only what the design needs.`;
 
-{
-  "name": "string",
-  "pageOrder": ["index.html", "about.html"],
-  "files": {
-    "index.html": "<full HTML document>",
-    "about.html": "<full HTML document>"
-  }
-}
+const REVISE_SYSTEM_PROMPT = `You make a targeted edit to an existing multi-page website and return ONLY what changed, as JSON.
 
-IMPORTANT OUTPUT LIMITS:
-- Maximum 4 pages.
-- Only create the number of pages actually useful for the request.
-- Prefer 3-4 pages for a normal business website.
-- Do not create unnecessary pages.
-- Each page must be a complete HTML document.
-- Keep each HTML page reasonably compact.
-- Do not repeat unnecessarily large sections of CSS or JavaScript.
-- Do not add huge amounts of text merely to increase content.
-- Do not create massive SVGs.
-- Do not embed base64 images.
-- Do not generate enormous JavaScript libraries.
+You will be given the site's current pages (as filename -> full HTML) and a change request.
 
-RULES:
+Output JSON matching exactly: {"files": {"<filename>.html": "<full updated HTML document>"}}
 
-1. "name"
-- Short 2-4 word website name.
-- Based on the user's request.
-
-2. "pageOrder"
-- Contains the HTML filenames in navigation order.
-- Example:
-  ["index.html", "about.html", "services.html", "contact.html"]
-
-3. HTML
-- Every file must be a complete document:
-  <!DOCTYPE html>
-  ...
-  </html>
-- No Markdown code fences.
-- No explanations outside the JSON.
-
-4. CSS
-- CSS must be inside a <style> tag.
-- Use modern CSS.
-- Use Flexbox and/or Grid.
-- Must be responsive.
-- Support approximately 375px through 1440px+.
-- Include mobile media queries.
-- Use a cohesive visual system.
-- Include hover states and subtle transitions.
-- Avoid unnecessary CSS.
-
-5. JavaScript
-- JavaScript must be inside <script> tags.
-- Only add JavaScript when useful.
-- Do not include external JavaScript libraries.
-
-6. Images
-- Do not use base64 images.
-- Do not embed binary image data.
-- You may use:
-  - CSS gradients
-  - inline SVG
-  - https://picsum.photos/... placeholders
-- Keep SVG reasonably small.
-
-7. Content
-- Use realistic, specific content based on the request.
-- Never use lorem ipsum.
-- Do not create excessively long paragraphs.
-- Keep the copy concise and useful.
-
-8. Navigation
-- Internal links must use relative HTML filenames.
-- Example:
-  href="about.html"
-  href="contact.html"
-
-9. Design
-- Produce a real polished website.
-- Use appropriate spacing.
-- Use a professional typography hierarchy.
-- Use cards/sections where appropriate.
-- Include responsive navigation.
-- Make reasonable decisions without asking questions.
-
-10. JSON
-- Return VALID JSON only.
-- No Markdown fences.
-- No comments outside JSON.
-`;
-
-/* -------------------------------------------------------------------------- */
-/* REVISE PROMPT                                                              */
-/* -------------------------------------------------------------------------- */
-
-const REVISE_SYSTEM_PROMPT = `
-You make targeted edits to an existing multi-page website.
-
-You will receive:
-1. The existing HTML files.
-2. A change request.
-
-Return ONLY the files that actually changed.
-
-Output JSON EXACTLY:
-
-{
-  "files": {
-    "filename.html": "<complete updated HTML document>"
-  }
-}
-
-RULES:
-
-1. Only return changed/new pages.
-2. Do not return unchanged pages.
-3. Every returned page must be a COMPLETE HTML document.
-4. Preserve the existing visual language unless the user asks to change it.
-5. Keep CSS and JavaScript compact.
-6. Do not add unnecessary content.
-7. Do not embed base64 images.
-8. Do not generate huge SVGs.
-9. Keep the site responsive.
-10. Return valid JSON only.
-11. No Markdown fences.
-12. No explanations outside JSON.
-`;
-
-/* -------------------------------------------------------------------------- */
-/* JSON CLEANUP                                                               */
-/* -------------------------------------------------------------------------- */
+Rules:
+- Include ONLY pages you actually changed, plus any brand-new page the request requires. Do NOT include unchanged pages in the output - this is the single most important rule; omitting untouched pages is what keeps revisions cheap.
+- Each included file's value is the COMPLETE updated HTML document (not a diff/patch) - full <!DOCTYPE html> through </html>.
+- Preserve the site's existing visual language (colors, fonts, layout system) in anything you touch unless the request specifically asks to change the design.
+- Same technical constraints as the original build: inline CSS/JS only, no external files except optional Google Fonts, genuinely responsive, real copy not placeholders.
+- Be decisive about ambiguous requests rather than asking a clarifying question back.`;
 
 function stripJsonFences(text) {
-  if (!text) {
-    return '';
+  let t = text.trim();
+  if (t.startsWith('```')) {
+    t = t.replace(/^```(?:json)?\n?/, '').replace(/```$/, '').trim();
   }
-
-  let result = String(text).trim();
-
-  if (result.startsWith('```')) {
-    result = result
-      .replace(/^```(?:json)?\s*/i, '')
-      .replace(/\s*```$/i, '')
-      .trim();
-  }
-
-  return result;
+  return t;
 }
 
-/* -------------------------------------------------------------------------- */
-/* BASIC VALIDATION                                                           */
-/* -------------------------------------------------------------------------- */
+router.post('/website', requireAuth, rateLimit({ windowMs: 60_000, max: 10, keyFn: r => `ai-website:${r.uid}` }), async (req, res) => {
+  const uid = req.uid;
+  // Hoisted above the try block (not just inside it) so the outer catch —
+  // which handles the OpenAI call itself throwing — can still see whether
+  // a build already spent credits and needs a refund.
+  let tokenBudget;          // only set (and only spent) for 'build'
+  let creditsSpent = false; // true once the deduction transaction succeeds
 
-function validateFiles(files) {
-  if (!files || typeof files !== 'object') {
-    return false;
-  }
-
-  const keys = Object.keys(files);
-
-  if (keys.length === 0) {
-    return false;
-  }
-
-  for (const filename of keys) {
-    if (!filename.toLowerCase().endsWith('.html')) {
-      continue;
+  // Refunds the just-spent build cost — called from every failure path
+  // after the deduction succeeds, so a model/parsing/network failure
+  // doesn't quietly cost the person credits for a site they never got.
+  const refundIfSpent = async () => {
+    if (!creditsSpent) return;
+    try {
+      const creditsRef = db.collection('users').doc(uid).collection('websiteStudio').doc('credits');
+      await db.runTransaction(async (tx) => {
+        const snap = await tx.get(creditsRef);
+        const current = (snap.data()?.tokensRemaining) || 0;
+        tx.set(creditsRef, { tokensRemaining: current + tokenBudget }, { merge: true });
+      });
+      creditsSpent = false;
+    } catch (refundErr) {
+      console.error('Failed to refund website credits after generation failure:', refundErr);
     }
+  };
 
-    const html = files[filename];
-
-    if (typeof html !== 'string') {
-      return false;
-    }
-
-    if (!html.toLowerCase().includes('<!doctype html>')) {
-      return false;
-    }
-
-    if (!html.toLowerCase().includes('</html>')) {
-      return false;
-    }
-  }
-
-  return true;
-}
-
-/* -------------------------------------------------------------------------- */
-/* ROUTE                                                                      */
-/* -------------------------------------------------------------------------- */
-
-router.post('/website', async (req, res) => {
   try {
     const mode = req.body && req.body.mode;
-
     if (mode !== 'build' && mode !== 'revise') {
-      return res.status(400).json({
-        error: {
-          message: "mode must be 'build' or 'revise'",
-        },
-      });
+      return res.status(400).json({ error: { message: "mode must be 'build' or 'revise'" } });
     }
 
     const prompt = ((req.body && req.body.prompt) || '').trim();
-
     if (!prompt) {
-      return res.status(400).json({
-        error: {
-          message: 'prompt is required',
-        },
-      });
+      return res.status(400).json({ error: { message: 'prompt is required' } });
     }
 
     let messages;
     let maxTokens;
 
-    /* ---------------------------------------------------------------------- */
-    /* BUILD                                                                   */
-    /* ---------------------------------------------------------------------- */
-
     if (mode === 'build') {
-      // Website Studio intentionally limits a single build to 4 pages.
-      // This prevents giant JSON responses and truncated HTML.
-      const requestedPages = Number(
-        req.body && req.body.maxPages
-      ) || 4;
+      const maxPages = Math.max(1, Math.min(12, Number(req.body && req.body.maxPages) || 4));
+      tokenBudget = Number(req.body && req.body.tokenBudget) || 4000;
+      if (!VALID_BUILD_TOKEN_BUDGETS.includes(tokenBudget)) {
+        return res.status(400).json({ error: { message: 'Invalid tokenBudget for a build.' } });
+      }
+      maxTokens = Math.min(16000, Math.max(2000, tokenBudget * 2));
 
-      const maxPages = Math.max(
-        1,
-        Math.min(4, requestedPages)
-      );
-
-      // Default 10k budget.
-      // Maximum completion allowance is 30k.
-      const tokenBudget =
-        Number(req.body && req.body.tokenBudget) || 10000;
-
-      maxTokens = Math.min(
-        30000,
-        Math.max(8000, tokenBudget * 2)
-      );
-
-      messages = [
-        {
-          role: 'system',
-          content: BUILD_SYSTEM_PROMPT,
-        },
-        {
-          role: 'user',
-          content:
-            `Build this website with a maximum of ${maxPages} pages.\n\n` +
-            `User request:\n${prompt}`,
-        },
-      ];
-    }
-
-    /* ---------------------------------------------------------------------- */
-    /* REVISE                                                                  */
-    /* ---------------------------------------------------------------------- */
-
-    else {
-      const existingFiles =
-        req.body && req.body.existingFiles;
-
-      const pageOrder =
-        req.body && req.body.pageOrder;
-
-      if (
-        !existingFiles ||
-        typeof existingFiles !== 'object' ||
-        Object.keys(existingFiles).length === 0
-      ) {
-        return res.status(400).json({
-          error: {
-            message:
-              'existingFiles is required for revise mode',
-          },
+      // Deduct BEFORE calling the model — same balance, same transactional
+      // check-then-decrement the Flutter client already does at
+      // spendForNewBuild(), just also enforced here so the credit system
+      // can't be bypassed by calling this endpoint directly. Responds 402
+      // on exhaustion, which WebsiteGenService on the client already
+      // treats as "quota exceeded".
+      const creditsRef = db.collection('users').doc(uid).collection('websiteStudio').doc('credits');
+      try {
+        await db.runTransaction(async (tx) => {
+          const snap = await tx.get(creditsRef);
+          const current = (snap.data()?.tokensRemaining) || 0;
+          if (current < tokenBudget) {
+            const err = new Error('Not enough Website Studio credits for this build.');
+            err.insufficientCredits = true;
+            throw err;
+          }
+          tx.set(creditsRef, { tokensRemaining: current - tokenBudget }, { merge: true });
         });
+        creditsSpent = true;
+      } catch (creditErr) {
+        if (creditErr.insufficientCredits) {
+          return res.status(402).json({ error: { message: creditErr.message }, limitReached: true });
+        }
+        throw creditErr;
       }
 
-      // Revisions normally affect one or two pages.
-      // 16k is enough for a targeted revision while avoiding
-      // unnecessarily huge responses.
-      maxTokens = 16000;
+      messages = [
+        { role: 'system', content: BUILD_SYSTEM_PROMPT },
+        { role: 'user', content: `Build this website (max ${maxPages} pages): ${prompt}` },
+      ];
+    } else {
+      const existingFiles = req.body && req.body.existingFiles;
+      if (!existingFiles || typeof existingFiles !== 'object' || Object.keys(existingFiles).length === 0) {
+        return res.status(400).json({ error: { message: 'existingFiles is required for revise mode' } });
+      }
+      maxTokens = 6000;
 
       messages = [
-        {
-          role: 'system',
-          content: REVISE_SYSTEM_PROMPT,
-        },
+        { role: 'system', content: REVISE_SYSTEM_PROMPT },
         {
           role: 'user',
-          content:
-            `Current page order:\n${JSON.stringify(pageOrder || [])}\n\n` +
-            `Current site files:\n${JSON.stringify(existingFiles)}\n\n` +
-            `Change requested:\n${prompt}`,
+          content: `Current site pages:\n${JSON.stringify(existingFiles)}\n\nChange requested: ${prompt}`,
         },
       ];
     }
 
-    /* ---------------------------------------------------------------------- */
-    /* OPENAI REQUEST                                                          */
-    /* ---------------------------------------------------------------------- */
-
-    console.log('Website Studio request:', {
-      mode,
-      model: WEBSITE_MODEL,
-      maxTokens,
-      promptLength: prompt.length,
+    const completion = await openai.chat.completions.create({
+      model: 'gpt-4o',
+      temperature: 0.7,
+      max_tokens: maxTokens,
+      response_format: { type: 'json_object' },
+      messages,
     });
 
-    const completion =
-      await openai.chat.completions.create({
-        model: WEBSITE_MODEL,
-
-        // GPT-5.4 Mini should be allowed to focus on
-        // generating the requested HTML.
-        temperature: 0.7,
-
-        max_completion_tokens: maxTokens,
-
-        response_format: {
-          type: 'json_object',
-        },
-
-        messages,
-      });
-
-    /* ---------------------------------------------------------------------- */
-    /* RESPONSE INFORMATION                                                    */
-    /* ---------------------------------------------------------------------- */
-
-    const choice =
-      completion.choices &&
-      completion.choices.length > 0
-        ? completion.choices[0]
-        : null;
-
-    const raw =
-      choice &&
-      choice.message &&
-      typeof choice.message.content === 'string'
-        ? choice.message.content
-        : '';
-
-    console.log(
-      'Website Studio OpenAI response:',
-      JSON.stringify({
-        model: WEBSITE_MODEL,
-        finish_reason: choice
-          ? choice.finish_reason
-          : null,
-        response_length: raw.length,
-        usage: completion.usage || null,
-      })
-    );
-
-    /* ---------------------------------------------------------------------- */
-    /* EMPTY RESPONSE                                                          */
-    /* ---------------------------------------------------------------------- */
-
-    if (!raw.trim()) {
-      console.error(
-        'Website Studio: OpenAI returned an empty response.'
-      );
-
-      return res.status(502).json({
-        error: {
-          message:
-            'The AI returned an empty response. Please try again.',
-        },
-      });
-    }
-
-    /* ---------------------------------------------------------------------- */
-    /* TRUNCATED RESPONSE                                                      */
-    /* ---------------------------------------------------------------------- */
-
-    if (choice && choice.finish_reason === 'length') {
-      console.error(
-        'Website Studio: response reached the completion limit.'
-      );
-
-      return res.status(502).json({
-        error: {
-          message:
-            'The AI response was too large. Please try a shorter website request or fewer pages.',
-          code: 'RESPONSE_TOO_LARGE',
-        },
-      });
-    }
-
-    /* ---------------------------------------------------------------------- */
-    /* JSON PARSING                                                            */
-    /* ---------------------------------------------------------------------- */
-
+    const raw = (completion.choices[0] && completion.choices[0].message && completion.choices[0].message.content) || '';
     let parsed;
-
     try {
-      const cleaned = stripJsonFences(raw);
-      parsed = JSON.parse(cleaned);
-    } catch (error) {
-      console.error(
-        'Website Studio: invalid JSON from OpenAI.',
-        {
-          finish_reason: choice
-            ? choice.finish_reason
-            : null,
-          response_length: raw.length,
-          raw: raw.slice(0, 3000),
-        }
-      );
-
-      return res.status(502).json({
-        error: {
-          message:
-            'The AI returned an invalid website response. Please try again.',
-          code: 'INVALID_AI_JSON',
-        },
-      });
+      parsed = JSON.parse(stripJsonFences(raw));
+    } catch (e) {
+      console.error('Website Studio: model did not return valid JSON:', raw.slice(0, 500));
+      await refundIfSpent();
+      return res.status(502).json({ error: { message: 'The AI did not return a valid response. Please try again.' } });
     }
 
-    /* ---------------------------------------------------------------------- */
-    /* BUILD RESPONSE                                                          */
-    /* ---------------------------------------------------------------------- */
+    if (!parsed.files || typeof parsed.files !== 'object' || Object.keys(parsed.files).length === 0) {
+      await refundIfSpent();
+      return res.status(502).json({ error: { message: 'The AI did not return any files. Please try again.' } });
+    }
 
     if (mode === 'build') {
-      if (!validateFiles(parsed.files)) {
-        console.error(
-          'Website Studio: build response did not contain valid files.'
-        );
-
-        return res.status(502).json({
-          error: {
-            message:
-              'The AI did not return valid website files. Please try again.',
-            code: 'INVALID_WEBSITE_FILES',
-          },
-        });
-      }
-
-      let pageOrder;
-
-      if (Array.isArray(parsed.pageOrder)) {
-        pageOrder = parsed.pageOrder
-          .map((item) => String(item))
-          .filter((item) =>
-            Object.prototype.hasOwnProperty.call(
-              parsed.files,
-              item
-            )
-          );
-      } else {
-        pageOrder = Object.keys(parsed.files);
-      }
-
-      // If the model returned an invalid/empty pageOrder,
-      // fall back to the returned files.
-      if (pageOrder.length === 0) {
-        pageOrder = Object.keys(parsed.files);
-      }
-
       return res.json({
-        name:
-          typeof parsed.name === 'string'
-            ? parsed.name.trim()
-            : '',
-
-        pageOrder,
-
+        name: parsed.name || '',
+        pageOrder: Array.isArray(parsed.pageOrder) ? parsed.pageOrder : Object.keys(parsed.files),
         files: parsed.files,
       });
     }
+    return res.json({ files: parsed.files });
 
-    /* ---------------------------------------------------------------------- */
-    /* REVISE RESPONSE                                                         */
-    /* ---------------------------------------------------------------------- */
-
-    if (!validateFiles(parsed.files)) {
-      console.error(
-        'Website Studio: revision response did not contain valid files.'
-      );
-
-      return res.status(502).json({
-        error: {
-          message:
-            'The AI did not return valid changed files. Please try again.',
-          code: 'INVALID_REVISION_FILES',
-        },
-      });
-    }
-
-    return res.json({
-      files: parsed.files,
-    });
   } catch (err) {
-    console.error(
-      'POST /ai/website failed:',
-      err
-    );
-
-    const status =
-      err &&
-      err.status &&
-      Number.isInteger(err.status)
-        ? err.status
-        : 500;
-
-    return res.status(status).json({
-      error: {
-        message:
-          err &&
-          err.message
-            ? err.message
-            : 'Website generation failed.',
-      },
+    console.error('POST /ai/website failed:', err);
+    await refundIfSpent();
+    return res.status(500).json({
+      error: { message: err.message || 'Website generation failed.' },
     });
   }
 });

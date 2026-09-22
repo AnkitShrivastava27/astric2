@@ -107,8 +107,22 @@ router.post('/ai/image', requireAuth, rateLimit({ windowMs: 60_000, max: 10, key
       return res.status(402).json({ error: 'Image generation limit reached for this month.', limitReached: true });
     }
 
+    // 🐞 FIX ("something went wrong" in Image Studio): this used to omit
+    // response_format, so xAI defaulted to returning a `url` pointing at
+    // its own image-storage domain. The Flutter client (ImageGenService)
+    // then had to do a SECOND, separate fetch of that URL from the
+    // device/browser to get actual bytes for the editor — and on Flutter
+    // WEB specifically, that's a cross-origin request straight from the
+    // browser to xAI's storage domain, which is exactly the kind of call
+    // CORS is designed to block unless that domain opts in. A blocked
+    // CORS request throws a raw, untyped network exception that isn't an
+    // HTTP error status at all, so it can silently miss whatever
+    // catch/status-code handling exists on the client and surface as a
+    // generic, unhelpful failure. Requesting b64_json instead means the
+    // image comes back as part of THIS response — no second cross-origin
+    // request, no CORS exposure, works identically on every platform.
     const upstream = await axios.post(GROK_IMAGE_URL, {
-      model: 'grok-imagine-image-quality', prompt, n: 1,
+      model: 'grok-imagine-image-quality', prompt, n: 1, response_format: 'b64_json',
     }, { headers: { Authorization: `Bearer ${GROK_API_KEY}`, 'Content-Type': 'application/json' }, timeout: 90_000 });
 
     await db.runTransaction(async (tx) => {

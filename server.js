@@ -77,7 +77,7 @@ app.listen(env.PORT, () => {
   // console.log(`    Firebase    : ${env.FIREBASE_PROJECT_ID}`);
   // console.log(`    EmailJS     : serviceId=${env.EMAILJS_SERVICE_ID || '(not set)'}`);
   // console.log(`    DeepSeek    : key_set=${env.DEEPSEEK_API_KEY.length > 0}`);
-   console.log(`    Grok (xAI)  : key_set=${env.GROK_API_KEY.length > 0}`);
+  // console.log(`    Grok (xAI)  : key_set=${env.GROK_API_KEY.length > 0}`);
   // console.log(`    OpenAI      : key_set=${env.OPENAI_API_KEY.length > 0}`);
   // console.log(`    Anthropic   : key_set=${env.ANTHROPIC_API_KEY.length > 0}`);
   // console.log(`    HubSpot     : client_id_set=${env.HUBSPOT_CLIENT_ID.length > 0}`);
