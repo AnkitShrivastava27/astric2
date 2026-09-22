@@ -95,7 +95,7 @@ router.post('/website', async (req, res) => {
 
     if (mode === 'build') {
       const maxPages = Math.max(1, Math.min(12, Number(req.body && req.body.maxPages) || 4));
-      const tokenBudget = Number(req.body && req.body.tokenBudget) || 4000;
+      const tokenBudget = Number(req.body && req.body.tokenBudget) || 8000;
       maxTokens = Math.min(16000, Math.max(2000, tokenBudget * 2));
 
       messages = [
@@ -126,18 +126,53 @@ router.post('/website', async (req, res) => {
       messages,
     });
 
-    const raw = (completion.choices[0] && completion.choices[0].message && completion.choices[0].message.content) || '';
-    let parsed;
-    try {
-      parsed = JSON.parse(stripJsonFences(raw));
-    } catch (e) {
-      console.error('Website Studio: model did not return valid JSON:', raw.slice(0, 500));
-      return res.status(502).json({ error: { message: 'The AI did not return a valid response. Please try again.' } });
-    }
+  const raw =
+  (completion.choices[0] &&
+    completion.choices[0].message &&
+    completion.choices[0].message.content) ||
+  '';
 
-    if (!parsed.files || typeof parsed.files !== 'object' || Object.keys(parsed.files).length === 0) {
-      return res.status(502).json({ error: { message: 'The AI did not return any files. Please try again.' } });
-    }
+console.log(
+  'Website Studio OpenAI response:',
+  JSON.stringify({
+    model: WEBSITE_MODEL,
+    finish_reason: completion.choices[0]?.finish_reason,
+    response_length: raw.length,
+  })
+);
+
+if (!raw.trim()) {
+  console.error('Website Studio: OpenAI returned an empty response.');
+
+  return res.status(502).json({
+    error: {
+      message: 'The AI returned an empty response. Please try again.',
+    },
+  });
+}
+
+let parsed;
+
+try {
+  parsed = JSON.parse(stripJsonFences(raw));
+} catch (e) {
+  console.error(
+    'Website Studio: invalid JSON from OpenAI.',
+    'finish_reason:',
+    completion.choices[0]?.finish_reason,
+    'raw:',
+    raw.slice(0, 2000)
+  );
+
+  return res.status(502).json({
+    error: {
+      message:
+        completion.choices[0]?.finish_reason === 'length'
+          ? 'The AI response was too large. Please try a shorter website request.'
+          : 'The AI returned an invalid website response. Please try again.',
+    },
+  });
+}
 
     if (mode === 'build') {
       return res.json({
