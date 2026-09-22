@@ -97,8 +97,8 @@ router.post('/website', async (req, res) => {
 
     if (mode === 'build') {
       const maxPages = Math.max(1, Math.min(12, Number(req.body && req.body.maxPages) || 4));
-      const tokenBudget = Number(req.body && req.body.tokenBudget) || 8000;
-      maxTokens = Math.min(16000, Math.max(2000, tokenBudget * 2));
+      const tokenBudget = Number(req.body && req.body.tokenBudget) || 12000;
+      maxTokens = Math.min(30000, Math.max(6000, tokenBudget * 2));
 
       messages = [
         { role: 'system', content: BUILD_SYSTEM_PROMPT },
