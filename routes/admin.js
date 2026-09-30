@@ -16,6 +16,15 @@ router.post('/update-pricing', requireAdmin, adminLimit, async (req, res) => {
     const priceFields = [
       'basic_monthly', 'basic_annual', 'standard_monthly', 'standard_annual',
       'premium_monthly', 'premium_annual', 'token_pack_price',
+      // NOTE: these three were already sent by the admin panel
+      // (client/src/pages/Pricing.jsx) and already read by
+      // routes/website-credits.js, but were missing from THIS whitelist —
+      // meaning the admin panel's website-price fields were silently
+      // dropped on save. Added them while adding the WhatsApp fields below,
+      // since it's the same list — remove if that gap was intentional.
+      'website_trial_price', 'website_standard_price', 'website_pro_price',
+      // WhatsApp Automation subscription pricing (see routes/whatsapp-subscription.js)
+      'whatsapp_monthly_price', 'whatsapp_annual_price',
     ];
     const update = {};
     for (const key of priceFields) {
@@ -26,6 +35,9 @@ router.post('/update-pricing', requireAdmin, adminLimit, async (req, res) => {
       }
     }
     if (req.body.vercel_api_url !== undefined) update.vercel_api_url = String(req.body.vercel_api_url).trim();
+    // Base URL of the deployed PHP WhatsApp backend — admin-configurable
+    // so it can move/redeploy without an app update (see pricing_provider.dart).
+    if (req.body.whatsapp_api_base_url !== undefined) update.whatsapp_api_base_url = String(req.body.whatsapp_api_base_url).trim();
     if (Object.keys(update).length === 0) return res.status(400).json({ error: 'No valid fields provided.' });
 
     update.updated_at = admin.firestore.FieldValue.serverTimestamp();
