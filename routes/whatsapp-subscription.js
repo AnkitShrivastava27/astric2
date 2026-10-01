@@ -176,4 +176,29 @@ router.post('/verify-whatsapp-order', requireAuth, async (req, res) => {
   }
 });
 
+async function fulfilWhatsappOrder(orderRef, extraOrderFields = {}) {
+  return db.runTransaction(async (tx) => {
+    const freshOrder = await tx.get(orderRef);
+    if (!freshOrder.exists || freshOrder.data().status === 'paid') return false; // race guard
+    const orderData = freshOrder.data();
+    const subscriptionRef = db.collection('users').doc(orderData.uid).collection('whatsapp').doc('subscription');
+    const now = new Date();
+    const subSnap = await tx.get(subscriptionRef);
+    const currentExpiresAt = subSnap.exists && subSnap.data().expiresAt ? new Date(subSnap.data().expiresAt) : null;
+    const base = (currentExpiresAt && currentExpiresAt > now) ? currentExpiresAt : now;
+    const expiresAt = new Date(base);
+    expiresAt.setMonth(expiresAt.getMonth() + orderData.months);
+    tx.set(subscriptionRef, {
+      plan: orderData.plan, status: 'active',
+      startedAt: subSnap.exists && subSnap.data().startedAt ? subSnap.data().startedAt : now.toISOString(),
+      expiresAt: expiresAt.toISOString(), orderId: orderData.orderId,
+    }, { merge: true });
+    tx.update(orderRef, { status: 'paid', paidAt: admin.firestore.FieldValue.serverTimestamp(), ...extraOrderFields });
+    return true;
+  });
+}
+
+router.PLANS = PLANS;
+router.priceForPlan = priceForPlan;
+router.fulfilWhatsappOrder = fulfilWhatsappOrder;
 module.exports = router;

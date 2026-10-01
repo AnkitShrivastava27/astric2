@@ -48,7 +48,7 @@ const app = express();
 
 // Capture the raw request body alongside the parsed JSON — needed by
 // services/meta.js to verify Meta's X-Hub-Signature-256 webhook signature.
-app.use(express.json({ verify: (req, _res, buf) => { req.rawBody = buf; } }));
+app.use(express.json({ limit: '2mb', verify: (req, _res, buf) => { req.rawBody = buf; } }));
 
 app.use(require('./middleware/cors'));
 
@@ -62,9 +62,13 @@ app.use(require('./routes/referral'));
 app.use(require('./routes/notifications'));
 app.use(require('./routes/integrations'));
 app.use(require('./routes/agent'));
-app.use(require('./routes/ai-website'))
+app.use(require('./routes/ai-website'));
+app.use(require('./routes/ai-app'));
+app.use(require('./routes/app-apk'));
+app.use(require('./routes/app-credits'));
 app.use(require('./routes/website-credits'));
 app.use(require('./routes/whatsapp-subscription'));
+app.use(require('./routes/payments.paypal.products'));
 
 const env = require('./config/env');
 const { CF_BASE_URL } = require('./services/cashfree');

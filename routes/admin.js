@@ -23,6 +23,7 @@ router.post('/update-pricing', requireAdmin, adminLimit, async (req, res) => {
       // dropped on save. Added them while adding the WhatsApp fields below,
       // since it's the same list — remove if that gap was intentional.
       'website_trial_price', 'website_standard_price', 'website_pro_price',
+      'app_trial_price', 'app_standard_price', 'app_pro_price',
       // WhatsApp Automation subscription pricing (see routes/whatsapp-subscription.js)
       'whatsapp_monthly_price', 'whatsapp_annual_price',
     ];

@@ -44,6 +44,7 @@ const OpenAI = require('openai');
 const { admin, db } = require('../config/firebase');
 const { requireAuth } = require('../middleware/auth');
 const { rateLimit } = require('../middleware/rateLimit');
+const { resolveOrgBilling } = require('../services/ai');
 
 const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
 
@@ -91,8 +92,11 @@ function stripJsonFences(text) {
   return t;
 }
 
-router.post('/website', requireAuth, rateLimit({ windowMs: 60_000, max: 10, keyFn: r => `ai-website:${r.uid}` }), async (req, res) => {
+router.post('/ai/website', requireAuth, rateLimit({ windowMs: 60_000, max: 10, keyFn: r => `ai-website:${r.uid}` }), async (req, res) => {
   const uid = req.uid;
+  // Credits belong to the org owner (the Flutter app reads them from there).
+  let creditUid = uid;
+  try { creditUid = (await resolveOrgBilling(uid))?.orgOwnerUid || uid; } catch (_) {}
   // Hoisted above the try block (not just inside it) so the outer catch —
   // which handles the OpenAI call itself throwing — can still see whether
   // a build already spent credits and needs a refund.
@@ -105,7 +109,7 @@ router.post('/website', requireAuth, rateLimit({ windowMs: 60_000, max: 10, keyF
   const refundIfSpent = async () => {
     if (!creditsSpent) return;
     try {
-      const creditsRef = db.collection('users').doc(uid).collection('websiteStudio').doc('credits');
+      const creditsRef = db.collection('users').doc(creditUid).collection('websiteStudio').doc('credits');
       await db.runTransaction(async (tx) => {
         const snap = await tx.get(creditsRef);
         const current = (snap.data()?.tokensRemaining) || 0;
@@ -145,7 +149,7 @@ router.post('/website', requireAuth, rateLimit({ windowMs: 60_000, max: 10, keyF
       // can't be bypassed by calling this endpoint directly. Responds 402
       // on exhaustion, which WebsiteGenService on the client already
       // treats as "quota exceeded".
-      const creditsRef = db.collection('users').doc(uid).collection('websiteStudio').doc('credits');
+      const creditsRef = db.collection('users').doc(creditUid).collection('websiteStudio').doc('credits');
       try {
         await db.runTransaction(async (tx) => {
           const snap = await tx.get(creditsRef);

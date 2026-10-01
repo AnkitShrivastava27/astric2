@@ -37,6 +37,7 @@ router.get('/config', rateLimit({ windowMs: 60_000, max: 30, keyFn: r => `config
       projects: 'basic', tasks: 'basic', employees: 'basic', sales: 'basic',
       currency: 'basic', files: 'basic', notes: 'basic', calendar: 'basic',
       reports: 'standard', kpis: 'standard', ai_chat: 'standard',
+      image_studio: 'standard', file_sharing: 'basic',
       email: 'standard', team_chat: 'standard', unified_inbox: 'standard',
       integrations: 'standard', data_storage: 'standard',
       pdf_analyst: 'premium',

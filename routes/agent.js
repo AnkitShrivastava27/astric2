@@ -9,7 +9,7 @@ const { rateLimit } = require('../middleware/rateLimit');
 const {
   TOOLS, getAgentModelConfig, resolveOrgContext, validateAction, executeAction,
 } = require('../services/agent');
-const { currentMonthKey, getAiLimitsConfig } = require('../services/ai');
+const { estimateTokens, reserveTokens, settleTokens } = require('../services/ai');
 
 // Reasoning-tier OpenAI models (gpt-5.x, o-series, etc.) reject the
 // classic `max_tokens` param and require `max_completion_tokens` instead.
@@ -34,6 +34,8 @@ Today's date is ${new Date().toISOString().slice(0, 10)}.`;
 // after they confirm.
 // =============================================================================
 router.post('/ai/agent', requireAuth, rateLimit({ windowMs: 60_000, max: 20, keyFn: r => `agent:${r.uid}` }), async (req, res) => {
+  let reservation = null;
+  let billing = null;
   try {
     const { message, history } = req.body;
     if (!message || typeof message !== 'string') {
@@ -51,23 +53,23 @@ router.post('/ai/agent', requireAuth, rateLimit({ windowMs: 60_000, max: 20, key
       return res.status(503).json({ error: 'Agent Mode is not enabled right now. Try again later.' });
     }
 
-    // Same quota pool as regular AI chat — agent calls are still LLM calls.
-    const usageRef = db.collection('users').doc(ctx.orgOwnerUid).collection('ai').doc('usage');
-    const usageSnap = await usageRef.get();
-    const curMonth = currentMonthKey();
-    const usageData = usageSnap.exists ? usageSnap.data() : {};
-    const tokensUsedThisMonth = usageData.lastResetMonth === curMonth ? Number(usageData.tokensUsedThisMonth || 0) : 0;
-    const limits = await getAiLimitsConfig();
-    const planLimit = limits.premium_tokens_limit; // ctx.plan is always 'premium' here
-    if (tokensUsedThisMonth >= planLimit) {
-      return res.status(402).json({ error: 'AI token limit reached for this month.', limitReached: true });
-    }
+    // Same quota pool (and same atomic reserve/settle) as regular AI chat.
+    // ctx.plan is always 'premium' here; the cycle comes from the org owner.
+    const ownerSnap = await db.collection('users').doc(ctx.orgOwnerUid).get();
+    billing = { orgOwnerUid: ctx.orgOwnerUid, plan: ctx.plan, cycle: ownerSnap.data()?.subscription?.cycle || 'monthly' };
 
     const messages = [
       { role: 'system', content: SYSTEM_PROMPT },
       ...(Array.isArray(history) ? history.slice(-10) : []),
       { role: 'user', content: message },
     ];
+
+    const promptEstimate = estimateTokens(messages) + 400; // + tool schema overhead
+    reservation = await reserveTokens({ ...billing, reserve: promptEstimate + 1024, minimum: promptEstimate + 50 });
+    if (!reservation.ok) {
+      reservation = null;
+      return res.status(402).json({ error: 'AI token limit reached for this month.', limitReached: true });
+    }
 
     const tokenLimitKey = usesMaxCompletionTokens(modelCfg.modelId)
       ? 'max_completion_tokens'
@@ -88,15 +90,8 @@ router.post('/ai/agent', requireAuth, rateLimit({ windowMs: 60_000, max: 20, key
     const toolCall = choice?.message?.tool_calls?.[0];
     const tokensConsumed = upstream.data?.usage?.total_tokens ?? 200;
 
-    await db.runTransaction(async (tx) => {
-      const fresh = await tx.get(usageRef);
-      const freshData = fresh.exists ? fresh.data() : {};
-      const already = freshData.lastResetMonth === curMonth ? Number(freshData.tokensUsedThisMonth || 0) : 0;
-      tx.set(usageRef, {
-        tokensUsedThisMonth: already + tokensConsumed, lastResetMonth: curMonth,
-        updatedAt: admin.firestore.FieldValue.serverTimestamp(),
-      }, { merge: true });
-    });
+    await settleTokens({ ...billing, reservation, actual: tokensConsumed });
+    reservation = null;
 
     if (!toolCall) {
       const reply = (choice?.message?.content || '').trim();
@@ -125,6 +120,7 @@ router.post('/ai/agent', requireAuth, rateLimit({ windowMs: 60_000, max: 20, key
     }
 
   } catch (err) {
+    if (reservation) await settleTokens({ ...billing, reservation, actual: 0 });
     const msg = err?.response?.data?.error?.message || err.message || 'Agent request failed.';
     console.error('/ai/agent error:', err?.response?.data || err.message);
     return res.status(500).json({ error: msg });

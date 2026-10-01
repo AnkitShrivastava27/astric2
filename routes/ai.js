@@ -8,7 +8,8 @@ const { requireAuth } = require('../middleware/auth');
 const { rateLimit } = require('../middleware/rateLimit');
 const {
   AI_CHAT_PROVIDERS, GROK_API_KEY, GROK_IMAGE_URL,
-  currentMonthKey, getAiLimitsConfig, getImageLimitsConfig,
+  currentMonthKey, normalizeMonthKey, getAiLimitsConfig, getImageLimitsConfig,
+  estimateTokens, reserveTokens, settleTokens, canAccessFeature, resolveOrgBilling,
 } = require('../services/ai');
 const { DEFAULT_AI_LIMITS } = require('../config/env');
 
@@ -19,8 +20,10 @@ const { DEFAULT_AI_LIMITS } = require('../config/env');
 // bypassed by claiming to be a different uid.
 // =============================================================================
 router.post('/ai/chat', requireAuth, rateLimit({ windowMs: 60_000, max: 30, keyFn: r => `ai-chat:${r.uid}` }), async (req, res) => {
+  let reservation = null;
+  let billing = null;
   try {
-    const { provider, model, messages, maxTokens, temperature, useCompletionTokens } = req.body;
+    const { provider, model, messages, maxTokens, maxCompletionTokens, temperature, useCompletionTokens } = req.body;
     const uid = req.uid;
 
     const cfg = AI_CHAT_PROVIDERS[provider];
@@ -30,50 +33,44 @@ router.post('/ai/chat', requireAuth, rateLimit({ windowMs: 60_000, max: 30, keyF
       return res.status(400).json({ error: 'messages array is required.' });
     }
 
-    const userSnap = await db.collection('users').doc(uid).get();
-    if (!userSnap.exists) return res.status(404).json({ error: 'User not found.' });
-    const userData = userSnap.data();
-    const plan = userData.subscription?.plan || 'basic';
-    const addonTokens = Number(userData.addonTokens || 0);
+    billing = await resolveOrgBilling(uid);
+    if (!billing) return res.status(404).json({ error: 'User not found.' });
 
-    const usageRef = db.collection('users').doc(uid).collection('ai').doc('usage');
-    const usageSnap = await usageRef.get();
-    const curMonth = currentMonthKey();
-    const usageData = usageSnap.exists ? usageSnap.data() : {};
-    const tokensUsedThisMonth = usageData.lastResetMonth === curMonth ? Number(usageData.tokensUsedThisMonth || 0) : 0;
-
-    const limits = await getAiLimitsConfig();
-    const planLimit = {
-      basic: limits.basic_tokens_limit, standard: limits.standard_tokens_limit, premium: limits.premium_tokens_limit,
-    }[plan] ?? limits.basic_tokens_limit;
-
-    if (tokensUsedThisMonth >= planLimit + addonTokens) {
+    // Cap the model's answer so one long reply can't blow far past the
+    // quota. (The old code only checked "used >= limit" BEFORE the call, so
+    // a user with 1 token left could still get a 4096-token answer — that's
+    // how a 10k plan ended at 11.6k.) Budget = what's left, minus the prompt.
+    const requested = Number(maxCompletionTokens || maxTokens) || 4096;
+    const promptEstimate = estimateTokens(messages);
+    const first = await reserveTokens({
+      ...billing, reserve: promptEstimate + Math.min(requested, 4096), minimum: promptEstimate + 50,
+    });
+    if (!first.ok) {
       return res.status(402).json({ error: 'AI token limit reached for this month.', limitReached: true });
     }
+    reservation = first;
+    const completionBudget = Math.max(50, Math.min(requested, first.reserved - promptEstimate));
 
     const tokenKey = useCompletionTokens ? 'max_completion_tokens' : 'max_tokens';
     const upstream = await axios.post(cfg.url, {
       model: model || cfg.defaultModel,
       messages,
-      [tokenKey]: maxTokens || 4096,
+      [tokenKey]: completionBudget,
       temperature: temperature ?? 0.7,
     }, { headers: { Authorization: `Bearer ${cfg.key}`, 'Content-Type': 'application/json' }, timeout: 45_000 });
 
     const reply = (upstream.data?.choices?.[0]?.message?.content || '').trim();
-    const tokensConsumed = upstream.data?.usage?.total_tokens ?? Math.ceil(reply.length / 4);
+    const tokensConsumed = upstream.data?.usage?.total_tokens
+      ?? (promptEstimate + Math.ceil(reply.length / 4));
 
-    await db.runTransaction(async (tx) => {
-      const fresh = await tx.get(usageRef);
-      const freshData = fresh.exists ? fresh.data() : {};
-      const already = freshData.lastResetMonth === curMonth ? Number(freshData.tokensUsedThisMonth || 0) : 0;
-      tx.set(usageRef, {
-        tokensUsedThisMonth: already + tokensConsumed, lastResetMonth: curMonth,
-        updatedAt: admin.firestore.FieldValue.serverTimestamp(),
-      }, { merge: true });
-    });
+    // Replace the reservation with the real number.
+    await settleTokens({ ...billing, reservation, actual: tokensConsumed });
+    reservation = null;
 
     return res.status(200).json({ reply, tokensConsumed });
   } catch (err) {
+    // Upstream failed → give the reserved tokens back; the user got nothing.
+    if (reservation) await settleTokens({ ...billing, reservation, actual: 0 });
     const msg = err?.response?.data?.error?.message || err?.response?.data?.message || err.message || 'AI request failed.';
     console.error('/ai/chat error:', err?.response?.data || err.message);
     return res.status(500).json({ error: msg });
@@ -90,18 +87,29 @@ router.post('/ai/image', requireAuth, rateLimit({ windowMs: 60_000, max: 10, key
     if (!prompt) return res.status(400).json({ error: 'prompt is required.' });
     if (!GROK_API_KEY) return res.status(500).json({ error: 'Image generation is not configured on the server.' });
 
-    const userSnap = await db.collection('users').doc(uid).get();
-    if (!userSnap.exists) return res.status(404).json({ error: 'User not found.' });
-    const plan = userSnap.data().subscription?.plan || 'basic';
+    // 🐞 FIX (Image Studio ignoring admin-panel plan gating): this used to
+    // hard-code "basic = 0 images" and never looked at the gating the admin
+    // edits (appConfig/planGating → image_studio). Now: (1) the plan must be
+    // allowed to use the Image Studio screen per the admin panel, and
+    // (2) the per-plan image quota is whatever the admin set — including a
+    // non-zero basic_images if they choose to give Basic some images.
+    // Plan + usage belong to the ORG OWNER (employees share the owner's pool).
+    const billing = await resolveOrgBilling(uid);
+    if (!billing) return res.status(404).json({ error: 'User not found.' });
+    const { plan, orgOwnerUid } = billing;
+
+    if (!(await canAccessFeature('image_studio', plan))) {
+      return res.status(403).json({ error: 'Image Studio is not available on your plan.', requiresUpgrade: true });
+    }
 
     const imgLimits = await getImageLimitsConfig();
-    const planImageLimit = { basic: 0, standard: imgLimits.standard_images, premium: imgLimits.premium_images }[plan] ?? 0;
+    const planImageLimit = { basic: imgLimits.basic_images, standard: imgLimits.standard_images, premium: imgLimits.premium_images }[plan] ?? 0;
 
-    const usageRef = db.collection('users').doc(uid).collection('ai').doc('usage');
+    const usageRef = db.collection('users').doc(orgOwnerUid).collection('ai').doc('usage');
     const usageSnap = await usageRef.get();
     const curMonth = currentMonthKey();
     const usageData = usageSnap.exists ? usageSnap.data() : {};
-    const imageGensThisMonth = usageData.lastResetMonth === curMonth ? Number(usageData.imageGensThisMonth || 0) : 0;
+    const imageGensThisMonth = normalizeMonthKey(usageData.lastResetMonth) === curMonth ? Number(usageData.imageGensThisMonth || 0) : 0;
 
     if (imageGensThisMonth >= planImageLimit) {
       return res.status(402).json({ error: 'Image generation limit reached for this month.', limitReached: true });
@@ -128,7 +136,7 @@ router.post('/ai/image', requireAuth, rateLimit({ windowMs: 60_000, max: 10, key
     await db.runTransaction(async (tx) => {
       const fresh = await tx.get(usageRef);
       const freshData = fresh.exists ? fresh.data() : {};
-      const already = freshData.lastResetMonth === curMonth ? Number(freshData.imageGensThisMonth || 0) : 0;
+      const already = normalizeMonthKey(freshData.lastResetMonth) === curMonth ? Number(freshData.imageGensThisMonth || 0) : 0;
       tx.set(usageRef, {
         imageGensThisMonth: already + 1, lastResetMonth: curMonth,
         updatedAt: admin.firestore.FieldValue.serverTimestamp(),

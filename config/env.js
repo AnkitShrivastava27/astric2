@@ -48,7 +48,7 @@ HUBSPOT_CLIENT_SECRET: process.env.HUBSPOT_CLIENT_SECRET || '',
   ANTHROPIC_API_KEY: process.env.ANTHROPIC_API_KEY || '',
 
   DEFAULT_AI_LIMITS: {
-    basic_tokens_limit: 5000,
+    basic_tokens_limit: 10000,
     standard_tokens_limit: 50000,
     premium_tokens_limit: 200000,
     token_pack_size: 10000,
