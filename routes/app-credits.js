@@ -14,16 +14,8 @@ const { CF_ENV, CF_BASE_URL, cfHeaders } = require('../services/cashfree');
 const { requireAuth } = require('../middleware/auth');
 const { rateLimit } = require('../middleware/rateLimit');
 
-// Mirrors WebsiteTier in app_project_model.dart — keep these two in
-// sync if the pricing ever changes. tokenBudget must match
-// AppTier.tokenBudget exactly, since spendForNewBuild() on the client
-// deducts that same amount for one build of that tier — a pack buys
-// exactly enough for one build.
-const TIERS = {
-  trial:    { tokenBudget: 2000,  priceField: 'app_trial_price',    fallbackPriceINR: 19 },
-  standard: { tokenBudget: 6000,  priceField: 'app_standard_price', fallbackPriceINR: 79 },
-  pro:      { tokenBudget: 12000, priceField: 'app_pro_price',      fallbackPriceINR: 199 },
-};
+// Tier table lives in services/appTiers.js (single source of truth).
+const { TIERS } = require('../services/appTiers');
 
 // Reads the admin-configurable price for a tier from pricing_config/plans
 // (the same doc + field names PricingConfig.fromJson reads on the Flutter
@@ -89,7 +81,7 @@ router.post('/create-app-credit-order', requireAuth, rateLimit({ windowMs: 60_00
     return res.status(200).json({ orderId, paymentSessionId, amountINR, environment: CF_ENV });
   } catch (err) {
     const msg = err?.response?.data?.message || err.message || 'Order creation failed.';
-    console.error('create-website-credit-order error:', err?.response?.data || err.message);
+    console.error('create-app-credit-order error:', err?.response?.data || err.message);
     return res.status(500).json({ error: msg });
   }
 });
