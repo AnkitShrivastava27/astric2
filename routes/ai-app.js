@@ -217,6 +217,15 @@ router.post('/ai/app', requireAuth, rateLimit({ windowMs: 60_000, max: 10, keyFn
       if (!existingFiles || typeof existingFiles !== 'object' || Object.keys(existingFiles).length === 0) {
         return res.status(400).json({ error: { message: 'existingFiles is required for revise mode' } });
       }
+      // Revisions don't spend credits, so they must still be locked to accounts
+      // that have bought App Studio — otherwise anyone could use the AI for free.
+      const accessSnap = await db.collection('users').doc(creditUid).collection('appStudio').doc('credits').get();
+      if (!accessSnap.exists) {
+        return res.status(402).json({
+          error: { message: 'App Studio is locked. Buy a pack in Billing → Top-ups to unlock it.' },
+          locked: true,
+        });
+      }
       maxTokens = 12000;
       existingFilesForConfig = existingFiles;
 

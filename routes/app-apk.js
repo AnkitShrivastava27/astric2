@@ -9,7 +9,7 @@
 // triggers a GitHub Actions workflow (free hosted runners already have the
 // Android SDK), and hands the finished .apk back to the app.
 //
-//   POST /ai/app/apk/build            { html, appName }  -> { buildId, cost }
+//   POST /ai/app/apk/build            { html, appName, projectId } -> { buildId, cost }
 //   GET  /ai/app/apk/status/:id                          -> { status, downloadUrl? }
 //   GET  /ai/app/apk/download/:id?exp=&sig=   (signed link, streams the .apk)
 //
@@ -28,7 +28,7 @@ const { requireAuth } = require('../middleware/auth');
 const { rateLimit } = require('../middleware/rateLimit');
 const { SERVER_BASE_URL } = require('../config/env');
 const { resolveOrgBilling } = require('../services/ai');
-const { sanitizeAppName, makeBuildId, makeAppId, makeSignedParams, verifySignedParams } = require('../services/apk');
+const { sanitizeAppName, makeBuildId, makeAppKey, makeEphemeralAppKey, makeAppId, PROJECT_ID_RE, makeSignedParams, verifySignedParams } = require('../services/apk');
 
 const REPO   = process.env.GITHUB_APK_REPO;
 const TOKEN  = process.env.GITHUB_APK_TOKEN;
@@ -96,10 +96,26 @@ router.post('/ai/app/apk/build', requireAuth,
     }
     const appName = sanitizeAppName(req.body?.appName);
     const buildId = makeBuildId();
-    const appId = makeAppId(buildId);
 
     const billing = await resolveOrgBilling(uid);
     const creditUid = billing?.orgOwnerUid || uid;
+
+    // Stable per-project identity → same package name + same signing key on
+    // every rebuild (so phones can update in place), and a different key for
+    // every project/company. The project must really belong to the paying org.
+    let appKey;
+    const projectId = req.body?.projectId;
+    if (projectId !== undefined && projectId !== null && projectId !== '') {
+      if (typeof projectId !== 'string' || !PROJECT_ID_RE.test(projectId)) {
+        return res.status(400).json({ error: 'Bad project id.' });
+      }
+      const proj = await db.collection('users').doc(creditUid).collection('appStudioProjects').doc(projectId).get();
+      if (!proj.exists) return res.status(404).json({ error: 'Project not found.' });
+      appKey = makeAppKey(creditUid, projectId);
+    } else {
+      appKey = makeEphemeralAppKey(buildId); // older client
+    }
+    const appId = makeAppId(appKey);
 
     // 1) Charge first (transactional) — refunded automatically on any failure below.
     try {
@@ -112,7 +128,7 @@ router.post('/ai/app/apk/build', requireAuth,
         }
         tx.set(creditsRef(creditUid), { tokensRemaining: cur - BUILD_COST }, { merge: true });
         tx.set(buildRef(buildId), {
-          uid, creditUid, appName, appId, cost: BUILD_COST, status: 'queued', refunded: false,
+          uid, creditUid, appName, appId, appKey, cost: BUILD_COST, status: 'queued', refunded: false,
           createdAt: admin.firestore.FieldValue.serverTimestamp(), createdAtMs: Date.now(),
         });
       });
@@ -132,8 +148,14 @@ router.post('/ai/app/apk/build', requireAuth,
       });
       await api.post(`/repos/${REPO}/actions/workflows/${WORKFLOW}/dispatches`, {
         ref: BRANCH,
-        inputs: { build_id: buildId, app_name: appName, app_id: appId },
+        inputs: { build_id: buildId, app_name: appName, app_id: appId, sign_id: appKey },
       });
+      // Registry of apps (one row per stable identity) — for support/audit.
+      db.collection('appApkApps').doc(appKey).set({
+        creditUid, appId, appName, projectId: projectId || null,
+        lastBuildAt: admin.firestore.FieldValue.serverTimestamp(),
+        builds: admin.firestore.FieldValue.increment(1),
+      }, { merge: true }).catch(() => {});
       return res.status(200).json({ buildId, cost: BUILD_COST });
     } catch (e) {
       console.error('apk build dispatch failed:', e?.response?.data || e.message);

@@ -13,10 +13,26 @@ function sanitizeAppName(raw) {
   return cleaned || 'My App';
 }
 
-// Unique, always-valid Android applicationId: com.astric.a<8 hex chars>
-// (each segment must start with a letter — hence the leading "a").
+// ── Per-app identity ────────────────────────────────────────────────────────
+// appKey = first 12 hex chars of SHA-256(<paying account uid>:<project id>).
+// It is STABLE for a project, so every rebuild of the same app gets the same
+// Android applicationId AND the same signing key — which is exactly what lets
+// a phone update the app in place (keeping its saved data) instead of forcing
+// an uninstall. Different projects / different companies always get different
+// keys, so no two customers ever share a signing identity.
+// applicationId = com.astric.a<appKey> (each segment must start with a letter,
+// hence the leading "a").
 function makeBuildId() { return crypto.randomBytes(4).toString('hex'); }
-function makeAppId(buildId) { return `com.astric.a${buildId}`; }
+function makeAppKey(creditUid, projectId) {
+  return crypto.createHash('sha256').update(`${creditUid}:${projectId}`).digest('hex').slice(0, 12);
+}
+// Fallback for older app versions that don't send a projectId: a throw-away
+// identity for just this build (cannot be updated in place — same as before).
+function makeEphemeralAppKey(buildId) {
+  return crypto.createHash('sha256').update(`ephemeral:${buildId}`).digest('hex').slice(0, 12);
+}
+function makeAppId(appKey) { return `com.astric.a${appKey}`; }
+const PROJECT_ID_RE = /^[A-Za-z0-9_-]{6,40}$/;
 
 // ── Signed, expiring download links ────────────────────────────────────────
 // The browser/OS downloader can't send an Authorization header, so the app
@@ -37,4 +53,4 @@ function verifySignedParams(secret, buildId, exp, sig, now = Date.now()) {
   return good.length === given.length && crypto.timingSafeEqual(good, given);
 }
 
-module.exports = { sanitizeAppName, makeBuildId, makeAppId, makeSignedParams, verifySignedParams };
+module.exports = { sanitizeAppName, makeBuildId, makeAppKey, makeEphemeralAppKey, makeAppId, PROJECT_ID_RE, makeSignedParams, verifySignedParams };
