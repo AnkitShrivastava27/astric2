@@ -69,7 +69,8 @@ Rules:
 - Images: CSS gradients, SVG, or https://picsum.photos/... placeholders only.
 - Internal links between pages use plain relative hrefs (e.g. href="about.html") even though the preview may render pages one at a time.
 - Be decisive about ambiguous requests - make a single reasonable interpretation and build it, rather than asking a clarifying question back.
-- Do not pad output: no repeated boilerplate comments, no unused CSS, no filler paragraphs added just to look "complete". Write only what the design needs.`;
+- Do not pad output: no repeated boilerplate comments, no unused CSS, no filler paragraphs added just to look "complete". Write only what the design needs.
+- You have a hard output limit. Keep EACH page compact: roughly 1,000-1,400 tokens (about 4,000-5,500 characters) including its CSS. Share one small, tight design system across pages instead of long per-page CSS. A complete, shorter site is always better than a long one that gets cut off.`;
 
 const REVISE_SYSTEM_PROMPT = `You make a targeted edit to an existing multi-page website and return ONLY what changed, as JSON.
 
@@ -90,6 +91,17 @@ function stripJsonFences(text) {
     t = t.replace(/^```(?:json)?\n?/, '').replace(/```$/, '').trim();
   }
   return t;
+}
+
+// Strips ``` fences and, if the model wrapped the JSON in extra words, keeps
+// only the outermost {...}.
+function parseModelJson(text) {
+  const t = stripJsonFences(text);
+  try { return JSON.parse(t); } catch (_) { /* fall through */ }
+  const a = t.indexOf('{');
+  const b = t.lastIndexOf('}');
+  if (a >= 0 && b > a) return JSON.parse(t.slice(a, b + 1));
+  throw new Error('no JSON object found');
 }
 
 router.post('/ai/website', requireAuth, rateLimit({ windowMs: 60_000, max: 10, keyFn: r => `ai-website:${r.uid}` }), async (req, res) => {
@@ -141,7 +153,11 @@ router.post('/ai/website', requireAuth, rateLimit({ windowMs: 60_000, max: 10, k
       if (!VALID_BUILD_TOKEN_BUDGETS.includes(tokenBudget)) {
         return res.status(400).json({ error: { message: 'Invalid tokenBudget for a build.' } });
       }
-      maxTokens = Math.min(16000, Math.max(2000, tokenBudget * 2));
+      // Output ceiling for the model's JSON reply. This is NOT the credit cost —
+      // it is only a cap. It used to be tokenBudget*2 (2,000 for the Trial pack),
+      // far below what even one multi-page site needs, so replies were cut off
+      // mid-file and failed to parse ("The AI did not return a valid response").
+      maxTokens = { 1000: 8000, 4500: 12000, 9000: 16000 }[tokenBudget] || 12000;
 
       // Deduct BEFORE calling the model — same balance, same transactional
       // check-then-decrement the Flutter client already does at
@@ -187,7 +203,7 @@ router.post('/ai/website', requireAuth, rateLimit({ windowMs: 60_000, max: 10, k
           locked: true,
         });
       }
-      maxTokens = 6000;
+      maxTokens = 12000; // a revision returns whole HTML documents for every touched page
 
       messages = [
         { role: 'system', content: REVISE_SYSTEM_PROMPT },
@@ -199,21 +215,26 @@ router.post('/ai/website', requireAuth, rateLimit({ windowMs: 60_000, max: 10, k
     }
 
     const completion = await openai.chat.completions.create({
-      model: 'gpt-5.4-mini',
+      model: 'gpt-4o',
       temperature: 0.7,
-     max_completion_tokens: maxTokens,
+      max_tokens: maxTokens,
       response_format: { type: 'json_object' },
       messages,
     });
 
-    const raw = (completion.choices[0] && completion.choices[0].message && completion.choices[0].message.content) || '';
+    const choice = completion.choices[0] || {};
+    const raw = (choice.message && choice.message.content) || '';
+    const finish = choice.finish_reason;
     let parsed;
     try {
-      parsed = JSON.parse(stripJsonFences(raw));
+      parsed = parseModelJson(raw);
     } catch (e) {
-      console.error('Website Studio: model did not return valid JSON:', raw.slice(0, 500));
+      console.error(`Website Studio: model did not return valid JSON (finish_reason=${finish}, ${raw.length} chars, max_tokens=${maxTokens}). Start: ${raw.slice(0, 200)} … End: ${raw.slice(-200)}`);
       await refundIfSpent();
-      return res.status(502).json({ error: { message: 'The AI did not return a valid response. Please try again.' } });
+      if (finish === 'length') {
+        return res.status(502).json({ error: { message: 'That website was too large to finish in one go. Try a simpler description or fewer pages — your credits were not used.' } });
+      }
+      return res.status(502).json({ error: { message: 'The AI did not return a valid response. Please try again — your credits were not used.' } });
     }
 
     if (!parsed.files || typeof parsed.files !== 'object' || Object.keys(parsed.files).length === 0) {

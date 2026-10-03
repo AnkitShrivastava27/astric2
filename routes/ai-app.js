@@ -78,6 +78,17 @@ function buildTierBrief(tier, maxScreens, minScreens) {
   return `Build this app. Screens: between ${minScreens} and ${maxScreens} (inclusive).` + (TIERS[tier].backend ? BACKEND_SECTION : '');
 }
 
+// Strips ``` fences and, if the model wrapped the JSON in extra words, keeps
+// only the outermost {...}.
+function parseModelJson(text) {
+  const t = stripJsonFences(text);
+  try { return JSON.parse(t); } catch (_) { /* fall through */ }
+  const a = t.indexOf('{');
+  const b = t.lastIndexOf('}');
+  if (a >= 0 && b > a) return JSON.parse(t.slice(a, b + 1));
+  throw new Error('no JSON object found');
+}
+
 function stripJsonFences(text) {
   let t = text.trim();
   if (t.startsWith('```')) {
@@ -180,7 +191,9 @@ router.post('/ai/app', requireAuth, rateLimit({ windowMs: 60_000, max: 10, keyFn
       }
       backendCfgForBuild = backendCfg;
       tokenBudget = tier.tokenBudget;
-      maxTokens = Math.min(16000, Math.max(4000, tokenBudget * 2)); // an app is one bigger file
+      // Output ceiling only (NOT the credit cost). Was tokenBudget*2 = 4,000 for the
+      // Trial pack, too small for a 2-3 screen app, so replies were cut off mid-file.
+      maxTokens = { trial: 9000, standard: 13000, pro: 16000 }[tierName] || 13000;
 
       // Deduct BEFORE calling the model — same balance, same transactional
       // check-then-decrement the Flutter client already does at
@@ -239,21 +252,25 @@ router.post('/ai/app', requireAuth, rateLimit({ windowMs: 60_000, max: 10, keyFn
     }
 
     const completion = await openai.chat.completions.create({
-      model: 'gpt-5.4-mini',
+      model: 'gpt-4o',
       temperature: 0.7,
-      max_completion_tokens: maxTokens,
+      max_tokens: maxTokens,
       response_format: { type: 'json_object' },
       messages,
     });
 
+    const finish = completion.choices[0] && completion.choices[0].finish_reason;
     const raw = (completion.choices[0] && completion.choices[0].message && completion.choices[0].message.content) || '';
     let parsed;
     try {
-      parsed = JSON.parse(stripJsonFences(raw));
+      parsed = parseModelJson(raw);
     } catch (e) {
       console.error('App Studio: model did not return valid JSON:', raw.slice(0, 500));
       await refundIfSpent();
-      return res.status(502).json({ error: { message: 'The AI did not return a valid response. Please try again.' } });
+      if (finish === 'length') {
+        return res.status(502).json({ error: { message: 'That app was too large to finish in one go. Try a simpler description or fewer screens — your credits were not used.' } });
+      }
+      return res.status(502).json({ error: { message: 'The AI did not return a valid response. Please try again — your credits were not used.' } });
     }
 
     if (!parsed.files || typeof parsed.files !== 'object' || Object.keys(parsed.files).length === 0) {
