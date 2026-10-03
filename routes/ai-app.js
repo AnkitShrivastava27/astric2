@@ -239,9 +239,9 @@ router.post('/ai/app', requireAuth, rateLimit({ windowMs: 60_000, max: 10, keyFn
     }
 
     const completion = await openai.chat.completions.create({
-      model: 'gpt-4o',
+      model: 'gpt-5.4-mini',
       temperature: 0.7,
-      max_tokens: maxTokens,
+      max_completion_tokens: maxTokens,
       response_format: { type: 'json_object' },
       messages,
     });
