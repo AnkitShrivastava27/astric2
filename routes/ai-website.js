@@ -178,6 +178,15 @@ router.post('/ai/website', requireAuth, rateLimit({ windowMs: 60_000, max: 10, k
       if (!existingFiles || typeof existingFiles !== 'object' || Object.keys(existingFiles).length === 0) {
         return res.status(400).json({ error: { message: 'existingFiles is required for revise mode' } });
       }
+      // Revisions don't spend credits, so they must still be locked to accounts
+      // that have bought Website Studio — otherwise anyone could use the AI free.
+      const accessSnap = await db.collection('users').doc(creditUid).collection('websiteStudio').doc('credits').get();
+      if (!accessSnap.exists) {
+        return res.status(402).json({
+          error: { message: 'Website Studio is locked. Buy a pack in Billing → Top-ups to unlock it.' },
+          locked: true,
+        });
+      }
       maxTokens = 6000;
 
       messages = [

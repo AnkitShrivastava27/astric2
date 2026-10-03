@@ -154,7 +154,7 @@ router.post('/verify-website-credit-order', requireAuth, async (req, res) => {
 
       const creditsSnap = await tx.get(creditsRef);
       const current = (creditsSnap.exists && creditsSnap.data().tokensRemaining) || 0;
-      tx.set(creditsRef, { tokensRemaining: current + orderData.tokenBudget }, { merge: true });
+      tx.set(creditsRef, { tokensRemaining: current + orderData.tokenBudget, purchased: true, lastPurchaseAt: admin.firestore.FieldValue.serverTimestamp() }, { merge: true });
       tx.update(orderRef, { status: 'paid', paidAt: admin.firestore.FieldValue.serverTimestamp(), cfOrderData: cfRes.data });
     });
 
@@ -177,7 +177,7 @@ async function fulfilWebsiteOrder(orderRef, extraOrderFields = {}) {
     const creditsRef = db.collection('users').doc(orderData.uid).collection('websiteStudio').doc('credits');
     const creditsSnap = await tx.get(creditsRef);
     const current = (creditsSnap.exists && creditsSnap.data().tokensRemaining) || 0;
-    tx.set(creditsRef, { tokensRemaining: current + orderData.tokenBudget }, { merge: true });
+    tx.set(creditsRef, { tokensRemaining: current + orderData.tokenBudget, purchased: true, lastPurchaseAt: admin.firestore.FieldValue.serverTimestamp() }, { merge: true });
     tx.update(orderRef, { status: 'paid', paidAt: admin.firestore.FieldValue.serverTimestamp(), ...extraOrderFields });
     return true;
   });
