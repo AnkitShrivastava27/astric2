@@ -45,7 +45,7 @@ router.post('/update-pricing', requireAdmin, adminLimit, async (req, res) => {
     // Tokens per PayPal pack - a whole number (e.g. $5 -> 500 tokens).
     if (req.body.paypal_token_pack_size !== undefined) {
       const n = Number(req.body.paypal_token_pack_size);
-      if (!Number.isInteger(n) || n < 1) return res.status(400).json({ error: 'paypal_token_pack_size must be a positive whole number.' });
+      if (!Number.isInteger(n) || n < 0) return res.status(400).json({ error: 'paypal_token_pack_size must be a whole number (0 to clear).' });
       update.paypal_token_pack_size = n;
     }
     if (req.body.vercel_api_url !== undefined) update.vercel_api_url = String(req.body.vercel_api_url).trim();
