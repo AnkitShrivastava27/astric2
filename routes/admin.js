@@ -26,6 +26,13 @@ router.post('/update-pricing', requireAdmin, adminLimit, async (req, res) => {
       'app_trial_price', 'app_standard_price', 'app_pro_price',
       // WhatsApp Automation subscription pricing (see routes/whatsapp-subscription.js)
       'whatsapp_monthly_price', 'whatsapp_annual_price',
+      // PayPal-only USD price list (see services/pricing.js getPaypalUsd).
+      'paypal_standard_monthly', 'paypal_standard_annual',
+      'paypal_premium_monthly', 'paypal_premium_annual',
+      'paypal_token_pack_price',
+      'paypal_website_trial', 'paypal_website_standard', 'paypal_website_pro',
+      'paypal_app_trial', 'paypal_app_standard', 'paypal_app_pro',
+      'paypal_whatsapp_monthly', 'paypal_whatsapp_annual',
     ];
     const update = {};
     for (const key of priceFields) {
@@ -34,6 +41,12 @@ router.post('/update-pricing', requireAdmin, adminLimit, async (req, res) => {
         if (isNaN(val) || val < 0) return res.status(400).json({ error: `${key} must be a non-negative number.` });
         update[key] = val;
       }
+    }
+    // Tokens per PayPal pack - a whole number (e.g. $5 -> 500 tokens).
+    if (req.body.paypal_token_pack_size !== undefined) {
+      const n = Number(req.body.paypal_token_pack_size);
+      if (!Number.isInteger(n) || n < 1) return res.status(400).json({ error: 'paypal_token_pack_size must be a positive whole number.' });
+      update.paypal_token_pack_size = n;
     }
     if (req.body.vercel_api_url !== undefined) update.vercel_api_url = String(req.body.vercel_api_url).trim();
     // Base URL of the deployed PHP WhatsApp backend — admin-configurable

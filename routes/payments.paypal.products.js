@@ -16,7 +16,7 @@ const axios = require('axios');
 const { v4: uuidv4 } = require('uuid');
 const { admin, db } = require('../config/firebase');
 const { PP_ENV, PP_BASE_URL, getPayPalAccessToken, ppHeaders } = require('../services/paypal');
-const { inrToUsd } = require('../services/pricing');
+const { getPaypalUsd } = require('../services/pricing');
 const { requireAuth } = require('../middleware/auth');
 const { rateLimit } = require('../middleware/rateLimit');
 const { SERVER_BASE_URL } = require('../config/env');
@@ -49,14 +49,18 @@ function extractPaypalError(err) {
   if (!data) return err.message || 'PayPal request failed.';
   const details = Array.isArray(data.details)
     ? data.details.map(d => d.description || d.issue).filter(Boolean).join('; ') : '';
+  if (Array.isArray(data.details) && data.details.some(d => d.issue === 'PAYEE_ACCOUNT_RESTRICTED')) {
+    return 'PayPal payments are temporarily unavailable. Please use Cashfree, or try again later.';
+  }
   return details ? `${data.message || data.name || 'PayPal error'}: ${details}` : (data.message || err.message);
 }
 
-async function createPayPalOrder({ kind, uid, userEmail, amountINR, description, orderFields }) {
+async function createPayPalOrder({ kind, uid, userEmail, amountINR, usdField, description, orderFields }) {
   const product = PRODUCTS[kind];
-  const amountUSD = await inrToUsd(amountINR);
+  // Own USD price (admin panel) if set, else INR converted.
+  const { usd: amountUSD } = await getPaypalUsd(usdField, amountINR);
   if (amountUSD < MIN_PAYPAL_USD) {
-    const e = new Error(`Amount too small for PayPal ($${amountUSD.toFixed(2)}). Minimum is $${MIN_PAYPAL_USD.toFixed(2)}. Please use Cashfree instead.`);
+    const e = new Error(`Amount too small for PayPal ($${amountUSD.toFixed(2)}). Minimum is $${MIN_PAYPAL_USD.toFixed(2)}. Set a PayPal price of at least $${MIN_PAYPAL_USD.toFixed(2)} in the admin panel, or use Cashfree.`);
     e.status = 400;
     throw e;
   }
@@ -99,7 +103,7 @@ router.post('/paypal/create-website-order', requireAuth,
       if (!req.body?.userEmail) return res.status(400).json({ error: 'userEmail is required.' });
       const amountINR = await websiteRoute.priceForTier(tierName);   // price from OUR config, never the client
       const out = await createPayPalOrder({
-        kind: 'website', uid: req.uid, userEmail: req.body.userEmail, amountINR,
+        kind: 'website', uid: req.uid, userEmail: req.body.userEmail, amountINR, usdField: `paypal_website_${tierName}`,
         description: `Website Studio - ${tierName} pack`,
         orderFields: { tier: tierName, tokenBudget: tier.tokenBudget },
       });
@@ -120,7 +124,7 @@ router.post('/paypal/create-app-order', requireAuth,
       if (!req.body?.userEmail) return res.status(400).json({ error: 'userEmail is required.' });
       const amountINR = await appRoute.priceForTier(tierName);
       const out = await createPayPalOrder({
-        kind: 'app', uid: req.uid, userEmail: req.body.userEmail, amountINR,
+        kind: 'app', uid: req.uid, userEmail: req.body.userEmail, amountINR, usdField: `paypal_app_${tierName}`,
         description: `App Studio - ${tierName} pack`,
         orderFields: { tier: tierName, tokenBudget: tier.tokenBudget },
       });
@@ -141,7 +145,7 @@ router.post('/paypal/create-whatsapp-order', requireAuth,
       if (!req.body?.userEmail) return res.status(400).json({ error: 'userEmail is required.' });
       const amountINR = await whatsappRoute.priceForPlan(planName);
       const out = await createPayPalOrder({
-        kind: 'whatsapp', uid: req.uid, userEmail: req.body.userEmail, amountINR,
+        kind: 'whatsapp', uid: req.uid, userEmail: req.body.userEmail, amountINR, usdField: `paypal_whatsapp_${planName}`,
         description: `WhatsApp Automation - ${planName} plan`,
         orderFields: { plan: planName, months: plan.months },
       });
@@ -187,9 +191,12 @@ router.get('/paypal/capture-product-order', async (req, res) => {
 // ── GET /paypal/order-status?kind=&orderId=  (requireAuth) ───────────────
 // Used by the web build, which can't watch a redirect inside a webview.
 router.get('/paypal/order-status', requireAuth, async (req, res) => {
-  const product = PRODUCTS[req.query.kind];
-  if (!product || !req.query.orderId) return res.status(400).json({ error: 'kind and orderId are required.' });
-  const snap = await db.collection(product.collection).doc(String(req.query.orderId)).get();
+  // Product orders live in their own collections; plan + AI-token orders
+  // share the 'orders' collection (kind = 'plan' | 'token').
+  const collections = { website: PRODUCTS.website.collection, app: PRODUCTS.app.collection, whatsapp: PRODUCTS.whatsapp.collection, plan: 'orders', token: 'orders' };
+  const collection = collections[req.query.kind];
+  if (!collection || !req.query.orderId) return res.status(400).json({ error: 'kind and orderId are required.' });
+  const snap = await db.collection(collection).doc(String(req.query.orderId)).get();
   if (!snap.exists || snap.data().uid !== req.uid) return res.status(404).json({ error: 'Order not found.' });
   return res.status(200).json({ status: snap.data().status });
 });

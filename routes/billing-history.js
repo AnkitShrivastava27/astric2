@@ -26,7 +26,7 @@ const SOURCES = [
     collection: 'orders',
     product: (o) => (o.orderType === 'tokens' ? 'tokens' : 'plan'),
     title: (o) => (o.orderType === 'tokens'
-      ? `AI tokens — ${num((o.tokenPacks || 0) * 10000)}`
+      ? `AI tokens — ${num(o.tokensToAdd || (o.tokenPacks || 0) * 10000)}`
       : `${cap(o.planType) || 'Plan'} plan — ${o.cycle === 'annual' ? 'Annual' : 'Monthly'}`),
   },
   { collection: 'websiteCreditOrders',        product: () => 'website',  title: (o) => `Website Studio — ${cap(o.tier) || 'pack'}` },

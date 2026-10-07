@@ -6,7 +6,7 @@ const axios = require('axios');
 const { v4: uuidv4 } = require('uuid');
 const { admin, db } = require('../config/firebase');
 const { PP_ENV, PP_CLIENT_ID, PP_BASE_URL, getPayPalAccessToken, ppHeaders } = require('../services/paypal');
-const { getCanonicalPrice, inrToUsd, getTokenPackPrice } = require('../services/pricing');
+const { getCanonicalPrice, getPaypalUsd, getPaypalTokenPack } = require('../services/pricing');
 const { requireAuth } = require('../middleware/auth');
 const { rateLimit } = require('../middleware/rateLimit');
 const { SERVER_BASE_URL } = require('../config/env');
@@ -22,6 +22,11 @@ function extractPaypalError(err) {
   const details = Array.isArray(data.details)
     ? data.details.map(d => d.description || d.issue).filter(Boolean).join('; ')
     : '';
+  // PAYEE_ACCOUNT_RESTRICTED is an account-level problem on PayPal's side
+  // (not a bug in this code) - say so plainly instead of a generic 422.
+  if (Array.isArray(data.details) && data.details.some(d => d.issue === 'PAYEE_ACCOUNT_RESTRICTED')) {
+    return 'PayPal payments are temporarily unavailable. Please use Cashfree, or try again later.';
+  }
   return details ? `${data.message || data.name || 'PayPal error'}: ${details}` : (data.message || err.message);
 }
 
@@ -47,10 +52,11 @@ router.post('/paypal/create-order', requireAuth, rateLimit({ windowMs: 60_000, m
     const amountINR = await getCanonicalPrice(planType, cycle);
     if (!amountINR || amountINR <= 0) return res.status(500).json({ error: 'Could not determine plan price.' });
 
-    const amountUSD = await inrToUsd(amountINR);
+    // PayPal has its own USD price list (admin panel); falls back to INR->USD.
+    const { usd: amountUSD } = await getPaypalUsd(`paypal_${planType}_${cycle}`, amountINR);
     if (amountUSD < MIN_PAYPAL_USD) {
       return res.status(400).json({
-        error: `Amount too small for PayPal ($${amountUSD.toFixed(2)}). Minimum is $${MIN_PAYPAL_USD.toFixed(2)}. Please use Cashfree instead.`,
+        error: `Amount too small for PayPal ($${amountUSD.toFixed(2)}). Minimum is $${MIN_PAYPAL_USD.toFixed(2)}. Set a PayPal price of at least $${MIN_PAYPAL_USD.toFixed(2)} in the admin panel, or use Cashfree.`,
       });
     }
 
@@ -204,13 +210,17 @@ router.post('/paypal/create-token-order', requireAuth, rateLimit({ windowMs: 60_
     if (!packs || packs < 1 || packs > 100) return res.status(400).json({ error: 'tokenPacks must be 1–100.' });
     if (!userEmail) return res.status(400).json({ error: 'userEmail is required.' });
 
-    const tokenPackPrice = await getTokenPackPrice();
-    const amountINR = tokenPackPrice * packs;
-    const amountUSD = await inrToUsd(amountINR);
+    // PayPal token pricing is independent of Cashfree: its own USD price per
+    // pack AND its own tokens-per-pack (admin panel: paypal_token_pack_price /
+    // paypal_token_pack_size, e.g. $5 -> 500 tokens).
+    const pack = await getPaypalTokenPack();
+    const amountUSD = Math.round(pack.priceUSD * packs * 100) / 100;
+    const tokensToAdd = pack.tokensPerPack * packs;
+    const amountINR = null; // not applicable - PayPal is priced in USD
     if (amountUSD < MIN_PAYPAL_USD) {
-      const minPacks = Math.ceil((MIN_PAYPAL_USD / amountUSD) * packs);
+      const minPacks = Math.ceil(MIN_PAYPAL_USD / pack.priceUSD);
       return res.status(400).json({
-        error: `Amount too small for PayPal ($${amountUSD.toFixed(2)}). Minimum is $${MIN_PAYPAL_USD.toFixed(2)} — buy at least ${minPacks} pack${minPacks > 1 ? 's' : ''}, or use Cashfree instead.`,
+        error: `Amount too small for PayPal ($${amountUSD.toFixed(2)}). Minimum is $${MIN_PAYPAL_USD.toFixed(2)} - buy at least ${minPacks} pack${minPacks > 1 ? 's' : ''}, or use Cashfree instead.`,
       });
     }
 
@@ -221,7 +231,7 @@ router.post('/paypal/create-token-order', requireAuth, rateLimit({ windowMs: 60_
       intent: 'CAPTURE',
       purchase_units: [{
         reference_id: orderId,
-        description: `${packs * 10000} AI tokens (${packs} pack${packs > 1 ? 's' : ''})`,
+        description: `${tokensToAdd} AI tokens (${packs} pack${packs > 1 ? 's' : ''})`,
         amount: { currency_code: 'USD', value: amountUSD.toFixed(2) },
         custom_id: JSON.stringify({ uid, tokenPacks: packs, internalOrderId: orderId }),
       }],
@@ -238,12 +248,12 @@ router.post('/paypal/create-token-order', requireAuth, rateLimit({ windowMs: 60_
     if (!approveUrl) return res.status(500).json({ error: 'PayPal did not return an approve URL.' });
 
     await db.collection('orders').doc(orderId).set({
-      orderId, uid, userEmail, orderType: 'tokens', tokenPacks: packs, amountINR, amountUSD,
+      orderId, uid, userEmail, orderType: 'tokens', tokenPacks: packs, tokensToAdd, amountINR, amountUSD,
       gateway: 'paypal', ppOrderId, status: 'pending', environment: PP_ENV,
       createdAt: admin.firestore.FieldValue.serverTimestamp(),
     });
 
-    return res.status(200).json({ paypalOrderId: ppOrderId, internalOrderId: orderId, approveUrl, amountUSD, amountINR, environment: PP_ENV });
+    return res.status(200).json({ paypalOrderId: ppOrderId, internalOrderId: orderId, approveUrl, amountUSD, tokensToAdd, environment: PP_ENV });
   } catch (err) {
     const msg = extractPaypalError(err) || 'PayPal token order failed.';
     console.error('paypal/create-token-order error:', err?.response?.data || err.message);
@@ -264,7 +274,7 @@ router.get('/paypal/capture-token-order', async (req, res) => {
     const orderData = orderSnap.data();
 
     if (orderData.status === 'paid') {
-      return res.status(200).json({ success: true, alreadyCredited: true, tokensAdded: orderData.tokenPacks * 10000 });
+      return res.status(200).json({ success: true, alreadyCredited: true, tokensAdded: orderData.tokensToAdd || orderData.tokenPacks * 10000 });
     }
     if (orderData.ppOrderId !== ppOrderId) {
       console.warn(`paypal/capture-token-order: ppOrderId mismatch for internalOrderId=${internalOrderId}`);
@@ -283,7 +293,7 @@ router.get('/paypal/capture-token-order', async (req, res) => {
 
     // Pack count from OUR stored order, never from the query string.
     const uid = orderData.uid;
-    const tokensAdded = orderData.tokenPacks * 10000;
+    const tokensAdded = orderData.tokensToAdd || orderData.tokenPacks * 10000;
 
     await db.runTransaction(async (tx) => {
       const fresh = await tx.get(db.collection('orders').doc(internalOrderId));
