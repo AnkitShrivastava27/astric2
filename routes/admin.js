@@ -33,6 +33,15 @@ router.post('/update-pricing', requireAdmin, adminLimit, async (req, res) => {
       'paypal_website_trial', 'paypal_website_standard', 'paypal_website_pro',
       'paypal_app_trial', 'paypal_app_standard', 'paypal_app_pro',
       'paypal_whatsapp_monthly', 'paypal_whatsapp_annual',
+      // Astric Voice minutes (see routes/voice-minutes.js). INR list:
+      //   trial = price + minutes, pack = price + minutes,
+      //   pay-as-you-go = rate per minute + minimum recharge.
+      'voice_trial_price', 'voice_trial_minutes', 'voice_pack_price', 'voice_pack_minutes',
+      'voice_rate_per_min', 'voice_min_recharge',
+      // 1 = trial can be bought once per account (default), 0 = unlimited.
+      'voice_trial_once',
+      // PayPal-only USD list (rate = USD per minute, min recharge = USD).
+      'paypal_voice_trial', 'paypal_voice_pack', 'paypal_voice_rate_per_min', 'paypal_voice_min_recharge',
     ];
     const update = {};
     for (const key of priceFields) {
@@ -48,10 +57,20 @@ router.post('/update-pricing', requireAdmin, adminLimit, async (req, res) => {
       if (!Number.isInteger(n) || n < 0) return res.status(400).json({ error: 'paypal_token_pack_size must be a whole number (0 to clear).' });
       update.paypal_token_pack_size = n;
     }
+    // Voice minutes are whole numbers; the trial-once switch is 0 or 1.
+    for (const key of ['voice_trial_minutes', 'voice_pack_minutes']) {
+      if (req.body[key] !== undefined && !Number.isInteger(Number(req.body[key]))) {
+        return res.status(400).json({ error: `${key} must be a whole number.` });
+      }
+    }
+    if (req.body.voice_trial_once !== undefined && ![0, 1].includes(Number(req.body.voice_trial_once))) {
+      return res.status(400).json({ error: 'voice_trial_once must be 0 or 1.' });
+    }
     if (req.body.vercel_api_url !== undefined) update.vercel_api_url = String(req.body.vercel_api_url).trim();
     // Base URL of the deployed PHP WhatsApp backend — admin-configurable
     // so it can move/redeploy without an app update (see pricing_provider.dart).
     if (req.body.whatsapp_api_base_url !== undefined) update.whatsapp_api_base_url = String(req.body.whatsapp_api_base_url).trim();
+    if (req.body.voice_api_base_url !== undefined) update.voice_api_base_url = String(req.body.voice_api_base_url).trim();
     if (Object.keys(update).length === 0) return res.status(400).json({ error: 'No valid fields provided.' });
 
     update.updated_at = admin.firestore.FieldValue.serverTimestamp();

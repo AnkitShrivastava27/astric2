@@ -1,6 +1,6 @@
 'use strict';
-// PayPal for Website Studio credit packs and the WhatsApp Automation
-// subscription (previously Cashfree-only). Same flow as the existing
+// PayPal for Website Studio credit packs, the WhatsApp Automation
+// subscription and Astric Voice minutes (previously Cashfree-only). Same flow as the existing
 // plan / token PayPal purchases in payments.paypal.js:
 //   1. POST  create-order   (requireAuth)  -> approveUrl
 //   2. user approves in PayPal; PayPal redirects the browser to
@@ -23,6 +23,7 @@ const { SERVER_BASE_URL } = require('../config/env');
 const websiteRoute = require('./website-credits');
 const whatsappRoute = require('./whatsapp-subscription');
 const appRoute = require('./app-credits');
+const voiceRoute = require('./voice-minutes');
 
 const MIN_PAYPAL_USD = 1.00;
 
@@ -42,6 +43,11 @@ const PRODUCTS = {
     prefix: 'PPWA',
     fulfil: (ref, extra) => whatsappRoute.fulfilWhatsappOrder(ref, extra),
   },
+  voice: {
+    collection: voiceRoute.ORDERS,
+    prefix: 'PPVOX',
+    fulfil: (ref, extra) => voiceRoute.fulfilVoiceOrder(ref, extra),
+  },
 };
 
 function extractPaypalError(err) {
@@ -55,10 +61,12 @@ function extractPaypalError(err) {
   return details ? `${data.message || data.name || 'PayPal error'}: ${details}` : (data.message || err.message);
 }
 
-async function createPayPalOrder({ kind, uid, userEmail, amountINR, usdField, description, orderFields }) {
+async function createPayPalOrder({ kind, uid, userEmail, amountINR, usdField, description, orderFields, usdOverride }) {
   const product = PRODUCTS[kind];
   // Own USD price (admin panel) if set, else INR converted.
-  const { usd: amountUSD } = await getPaypalUsd(usdField, amountINR);
+  // usdOverride (optional, voice pay-as-you-go only): the exact USD the server
+  // already priced — skips the admin-price / INR-conversion lookup.
+  const amountUSD = usdOverride != null ? usdOverride : (await getPaypalUsd(usdField, amountINR)).usd;
   if (amountUSD < MIN_PAYPAL_USD) {
     const e = new Error(`Amount too small for PayPal ($${amountUSD.toFixed(2)}). Minimum is $${MIN_PAYPAL_USD.toFixed(2)}. Set a PayPal price of at least $${MIN_PAYPAL_USD.toFixed(2)} in the admin panel, or use Cashfree.`);
     e.status = 400;
@@ -156,6 +164,28 @@ router.post('/paypal/create-whatsapp-order', requireAuth,
     }
   });
 
+// ── POST /paypal/create-voice-order  { plan, amount?, userEmail } ────────
+// plan = 'trial' | 'pack' | 'payg'. For payg, amount is whole/2dp USD.
+router.post('/paypal/create-voice-order', requireAuth,
+  rateLimit({ windowMs: 60_000, max: 10, keyFn: r => `pp-vox:${r.uid}` }), async (req, res) => {
+    try {
+      const { plan, amount, userEmail } = req.body || {};
+      if (!userEmail) return res.status(400).json({ error: 'userEmail is required.' });
+      // Plan, minutes and price all come from OUR config, never the client.
+      const quote = await voiceRoute.quoteVoice({ uid: req.uid, plan, amount, gateway: 'paypal' });
+      const out = await createPayPalOrder({
+        kind: 'voice', uid: req.uid, userEmail, amountINR: quote.amountINR, usdField: quote.usdField,
+        usdOverride: quote.amountUSD,
+        description: `Astric Voice - ${plan} (${quote.minutes} min)`,
+        orderFields: { plan, minutes: quote.minutes },
+      });
+      return res.status(200).json({ ...out, minutes: quote.minutes });
+    } catch (err) {
+      console.error('paypal/create-voice-order error:', err?.response?.data || err.message);
+      return res.status(err.status || 500).json({ error: err.status ? err.message : extractPaypalError(err) });
+    }
+  });
+
 // ── GET /paypal/capture-product-order  (PayPal redirect target) ──────────
 router.get('/paypal/capture-product-order', async (req, res) => {
   const { token: ppOrderId, internalOrderId, kind } = req.query;
@@ -193,7 +223,7 @@ router.get('/paypal/capture-product-order', async (req, res) => {
 router.get('/paypal/order-status', requireAuth, async (req, res) => {
   // Product orders live in their own collections; plan + AI-token orders
   // share the 'orders' collection (kind = 'plan' | 'token').
-  const collections = { website: PRODUCTS.website.collection, app: PRODUCTS.app.collection, whatsapp: PRODUCTS.whatsapp.collection, plan: 'orders', token: 'orders' };
+  const collections = { website: PRODUCTS.website.collection, app: PRODUCTS.app.collection, whatsapp: PRODUCTS.whatsapp.collection, voice: PRODUCTS.voice.collection, plan: 'orders', token: 'orders' };
   const collection = collections[req.query.kind];
   if (!collection || !req.query.orderId) return res.status(400).json({ error: 'kind and orderId are required.' });
   const snap = await db.collection(collection).doc(String(req.query.orderId)).get();

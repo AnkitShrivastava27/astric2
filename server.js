@@ -69,6 +69,7 @@ app.use(require('./routes/app-apk'));
 app.use(require('./routes/app-credits'));
 app.use(require('./routes/website-credits'));
 app.use(require('./routes/whatsapp-subscription'));
+app.use(require('./routes/voice-minutes'));
 app.use(require('./routes/payments.paypal.products'));
 app.use(require('./routes/billing-history'));
 

@@ -7,6 +7,7 @@
 //   website  Website Studio packs                       (websiteCreditOrders)
 //   app      App Studio packs                           (appCreditOrders)
 //   whatsapp WhatsApp Automation subscriptions          (whatsappSubscriptionOrders)
+//   voice    Astric Voice minutes                       (voiceMinuteOrders)
 //
 // Powers the Billing → History tab. Reads server-side, filtered by the
 // verified uid; sorting is done in memory so no composite index is needed.
@@ -32,6 +33,7 @@ const SOURCES = [
   { collection: 'websiteCreditOrders',        product: () => 'website',  title: (o) => `Website Studio — ${cap(o.tier) || 'pack'}` },
   { collection: 'appCreditOrders',            product: () => 'app',      title: (o) => `App Studio — ${cap(o.tier) || 'pack'}` },
   { collection: 'whatsappSubscriptionOrders', product: () => 'whatsapp', title: (o) => `WhatsApp Automation — ${cap(o.plan) || 'plan'}` },
+  { collection: 'voiceMinuteOrders',          product: () => 'voice',    title: (o) => `Astric Voice — ${num(o.minutes)} min` },
 ];
 
 router.get('/billing/purchases', requireAuth, rateLimit({ windowMs: 60_000, max: 30, keyFn: r => `billing-history:${r.uid}` }), async (req, res) => {
