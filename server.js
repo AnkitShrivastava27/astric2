@@ -72,6 +72,7 @@ app.use(require('./routes/whatsapp-subscription'));
 app.use(require('./routes/voice-minutes'));
 app.use(require('./routes/payments.paypal.products'));
 app.use(require('./routes/billing-history'));
+app.use(require('./routes/employees'));
 
 const env = require('./config/env');
 const { CF_BASE_URL } = require('./services/cashfree');
