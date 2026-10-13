@@ -19,6 +19,7 @@
 //   POST   /employees              -> create (checks limit, creates login + records)
 //   PATCH  /employees/:id          -> edit details (optionally email / password)
 //   DELETE /employees/:id          -> remove login + records
+//   POST   /employees/sync-team-chat -> make sure every employee is in the team group chat
 'use strict';
 
 const express = require('express');
@@ -26,6 +27,7 @@ const router = express.Router();
 const { admin, db } = require('../config/firebase');
 const { requireAuth } = require('../middleware/auth');
 const { rateLimit } = require('../middleware/rateLimit');
+const teamChat = require('../services/teamChat');
 
 const DEFAULT_LIMITS = { basic: 3, standard: 10, premium: 20 };
 const EMP_TYPES = ['fullTime', 'partTime', 'contractor', 'intern'];
@@ -199,6 +201,10 @@ router.post('/employees',
       }
       throw e;
     }
+    // Put them in the team group chat right now (server-side, additive). Best-effort: a chat problem
+    // must never undo or fail a successful employee creation.
+    try { await teamChat.addMembers(adminId, adminUser.organizationName, [uid]); }
+    catch (e) { console.warn('[employees] team chat add failed:', e.message); }
     res.status(201).json({ uid, empId });
   }));
 
@@ -257,8 +263,24 @@ router.delete('/employees/:id', requireAuth, wrap(async (req, res) => {
   batch.delete(empRef);
   if (prof.exists) batch.delete(db.collection('users').doc(id));
   await batch.commit();
+  try { await teamChat.removeMember(adminId, id); }
+  catch (e) { console.warn('[employees] team chat remove failed:', e.message); }
   res.json({ ok: true });
 }));
+
+// ── POST /employees/sync-team-chat ────────────────────────────────────────────
+// Idempotent, additive. Reads the REAL employees collection (not any app's cached list) and makes
+// sure each one — plus the admin — is in the team group chat. Safe to call on every admin app start.
+router.post('/employees/sync-team-chat',
+  requireAuth,
+  rateLimit({ windowMs: 60_000, max: 6, keyFn: r => `team-sync:${r.uid}` }),
+  wrap(async (req, res) => {
+    const adminUser = await requireAdminUser(req.uid);
+    const snap = await db.collection('users').doc(req.uid).collection('employees').select().get();
+    const ids = snap.docs.map((d) => d.id);
+    const ref = await teamChat.addMembers(req.uid, adminUser.organizationName, ids);
+    res.json({ ok: !!ref, members: ids.length + 1 });
+  }));
 
 module.exports = router;
 module.exports._test = { currentPlan, limitFor, cleanFields };
