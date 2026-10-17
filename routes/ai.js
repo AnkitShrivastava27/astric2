@@ -102,18 +102,44 @@ router.post('/ai/image', requireAuth, rateLimit({ windowMs: 60_000, max: 10, key
       return res.status(403).json({ error: 'Image Studio is not available on your plan.', requiresUpgrade: true });
     }
 
+    // Per-company limit set in the admin panel (special plan) wins over the per-plan table.
     const imgLimits = await getImageLimitsConfig();
-    const planImageLimit = { basic: imgLimits.basic_images, standard: imgLimits.standard_images, premium: imgLimits.premium_images }[plan] ?? 0;
+    const tableLimit = { basic: imgLimits.basic_images, standard: imgLimits.standard_images, premium: imgLimits.premium_images }[plan] ?? 0;
+    const planImageLimit = billing.customLimits?.images ?? tableLimit;
 
     const usageRef = db.collection('users').doc(orgOwnerUid).collection('ai').doc('usage');
-    const usageSnap = await usageRef.get();
     const curMonth = currentMonthKey();
-    const usageData = usageSnap.exists ? usageSnap.data() : {};
-    const imageGensThisMonth = normalizeMonthKey(usageData.lastResetMonth) === curMonth ? Number(usageData.imageGensThisMonth || 0) : 0;
 
-    if (imageGensThisMonth >= planImageLimit) {
-      return res.status(402).json({ error: 'Image generation limit reached for this month.', limitReached: true });
+    // RESERVE the image first, atomically — two parallel requests can no longer both slip under the
+    // cap (the old code checked, called the model, and only then counted). Refunded if the model fails.
+    const reservation = await db.runTransaction(async (tx) => {
+      const snap = await tx.get(usageRef);
+      const d = snap.exists ? snap.data() : {};
+      const rolled = normalizeMonthKey(d.lastResetMonth) !== curMonth;
+      const used = rolled ? 0 : Number(d.imageGensThisMonth || 0);
+      if (used >= planImageLimit) return { ok: false, used };
+      tx.set(usageRef, {
+        imageGensThisMonth: used + 1, lastResetMonth: curMonth,
+        // new month: the token counter must roll over too, since we are about to stamp the new month
+        ...(rolled ? { tokensUsedThisMonth: 0 } : {}),
+        updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+      }, { merge: true });
+      return { ok: true, used: used + 1 };
+    });
+    if (!reservation.ok) {
+      return res.status(402).json({
+        error: planImageLimit > 0
+          ? `Your organisation has used all ${planImageLimit} image generations for this month.`
+          : 'Image generation is not included in your current plan.',
+        limitReached: true, limit: planImageLimit, used: reservation.used,
+      });
     }
+    const refundImage = () => db.runTransaction(async (tx) => {
+      const snap = await tx.get(usageRef);
+      const d = snap.exists ? snap.data() : {};
+      if (normalizeMonthKey(d.lastResetMonth) !== curMonth) return;
+      tx.set(usageRef, { imageGensThisMonth: Math.max(0, Number(d.imageGensThisMonth || 0) - 1) }, { merge: true });
+    }).catch((e) => console.error('image refund failed:', e.message));
 
     // 🐞 FIX ("something went wrong" in Image Studio): this used to omit
     // response_format, so xAI defaulted to returning a `url` pointing at
@@ -129,19 +155,15 @@ router.post('/ai/image', requireAuth, rateLimit({ windowMs: 60_000, max: 10, key
     // generic, unhelpful failure. Requesting b64_json instead means the
     // image comes back as part of THIS response — no second cross-origin
     // request, no CORS exposure, works identically on every platform.
-    const upstream = await axios.post(GROK_IMAGE_URL, {
-      model: 'grok-imagine-image-quality', prompt, n: 1, response_format: 'b64_json',
-    }, { headers: { Authorization: `Bearer ${GROK_API_KEY}`, 'Content-Type': 'application/json' }, timeout: 90_000 });
-
-    await db.runTransaction(async (tx) => {
-      const fresh = await tx.get(usageRef);
-      const freshData = fresh.exists ? fresh.data() : {};
-      const already = normalizeMonthKey(freshData.lastResetMonth) === curMonth ? Number(freshData.imageGensThisMonth || 0) : 0;
-      tx.set(usageRef, {
-        imageGensThisMonth: already + 1, lastResetMonth: curMonth,
-        updatedAt: admin.firestore.FieldValue.serverTimestamp(),
-      }, { merge: true });
-    });
+    let upstream;
+    try {
+      upstream = await axios.post(GROK_IMAGE_URL, {
+        model: 'grok-imagine-image-quality', prompt, n: 1, response_format: 'b64_json',
+      }, { headers: { Authorization: `Bearer ${GROK_API_KEY}`, 'Content-Type': 'application/json' }, timeout: 90_000 });
+    } catch (e) {
+      await refundImage();   // the user did not get an image, so it must not count
+      throw e;
+    }
 
     return res.status(200).json(upstream.data);
   } catch (err) {

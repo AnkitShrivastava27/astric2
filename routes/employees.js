@@ -18,7 +18,8 @@
 //   GET    /employees/limit        -> { plan, count, max, unlimited, canAdd }
 //   POST   /employees              -> create (checks limit, creates login + records)
 //   PATCH  /employees/:id          -> edit details (optionally email / password)
-//   DELETE /employees/:id          -> remove login + records
+//   DELETE /employees/:id          -> remove login + records + every reference (chat, leads, tasks...)
+//   POST   /employees/cleanup-orphans -> repair leftovers from employees deleted earlier
 //   POST   /employees/sync-team-chat -> make sure every employee is in the team group chat
 'use strict';
 
@@ -28,6 +29,7 @@ const { admin, db } = require('../config/firebase');
 const { requireAuth } = require('../middleware/auth');
 const { rateLimit } = require('../middleware/rateLimit');
 const teamChat = require('../services/teamChat');
+const { purgeEmployee, repairOrphans } = require('../services/employeeCleanup');
 
 const DEFAULT_LIMITS = { basic: 3, standard: 10, premium: 20 };
 const EMP_TYPES = ['fullTime', 'partTime', 'contractor', 'intern'];
@@ -259,14 +261,25 @@ router.delete('/employees/:id', requireAuth, wrap(async (req, res) => {
   if (prof.exists && prof.data().adminId !== adminId) throw new HttpError(403, 'This is not your employee.', 'forbidden');
 
   await admin.auth().deleteUser(id).catch((e) => { if (e.code !== 'auth/user-not-found') throw e; });
-  const batch = db.batch();
-  batch.delete(empRef);
-  if (prof.exists) batch.delete(db.collection('users').doc(id));
-  await batch.commit();
-  try { await teamChat.removeMember(adminId, id); }
-  catch (e) { console.warn('[employees] team chat remove failed:', e.message); }
-  res.json({ ok: true });
+  await empRef.delete();
+  // Remove them EVERYWHERE: profile + subcollections, chat rooms/DMs, lead & customer owners,
+  // task assignees, file shares. Best-effort: a clean-up hiccup never fails a delete that worked.
+  let cleanup = null;
+  try { cleanup = await purgeEmployee(adminId, id, { name: empSnap.data().name || (prof.exists ? prof.data().name : '') }); }
+  catch (e) { console.warn('[employees] cleanup failed:', e.message); }
+  res.json({ ok: true, cleanup });
 }));
+
+// ── POST /employees/cleanup-orphans ───────────────────────────────────────────
+// Repairs data left behind by employees deleted BEFORE the full clean-up existed (stale chat
+// members, DMs, lead/customer owners, shares). Idempotent; called by the admin app on start.
+router.post('/employees/cleanup-orphans',
+  requireAuth,
+  rateLimit({ windowMs: 60_000, max: 4, keyFn: r => `emp-orphans:${r.uid}` }),
+  wrap(async (req, res) => {
+    await requireAdminUser(req.uid);
+    res.json({ ok: true, ...(await repairOrphans(req.uid)) });
+  }));
 
 // ── POST /employees/sync-team-chat ────────────────────────────────────────────
 // Idempotent, additive. Reads the REAL employees collection (not any app's cached list) and makes

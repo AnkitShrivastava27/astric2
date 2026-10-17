@@ -34,7 +34,7 @@ router.get('/config', rateLimit({ windowMs: 60_000, max: 30, keyFn: r => `config
 
     const DEFAULT_SCREEN_ACCESS = {
       finance: 'basic', invoices: 'basic', customers: 'basic', leads: 'basic',
-      projects: 'basic', tasks: 'basic', employees: 'basic', sales: 'basic',
+      projects: 'basic', products: 'basic', tasks: 'basic', employees: 'basic', sales: 'basic',
       currency: 'basic', files: 'basic', notes: 'basic', calendar: 'basic',
       reports: 'standard', kpis: 'standard', ai_chat: 'standard',
       image_studio: 'standard', file_sharing: 'basic',

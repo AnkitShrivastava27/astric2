@@ -50,8 +50,29 @@ async function getImageLimitsConfig() {
 // with a stale local copy).
 // -----------------------------------------------------------------------------
 
+// The plan an organisation is on RIGHT NOW, from users/{owner}.subscription.
+// An inactive or expired paid plan counts as Basic (this is what the Flutter app already does).
+// Also returns the admin panel's per-company overrides ("special plan"):
+//   subscription.customLimits.aiTokens / .images  -> that company's own monthly limits.
+// Overrides stop applying once the plan has expired.
+function effectiveSubscription(sub) {
+  const s = sub || {};
+  const stored = ['basic', 'standard', 'premium'].includes(s.plan) ? s.plan : 'basic';
+  const exp = s.expiresAt && typeof s.expiresAt.toDate === 'function' ? s.expiresAt.toDate() : null;
+  const expired = stored !== 'basic' && (s.active !== true || (exp && exp.getTime() <= Date.now()));
+  const num = (v) => (v === null || v === undefined || v === '' || isNaN(Number(v)) ? null : Math.max(0, Math.floor(Number(v))));
+  return {
+    plan: expired ? 'basic' : stored,
+    cycle: s.cycle === 'annual' ? 'annual' : 'monthly',
+    expired: !!expired,
+    custom: expired ? { aiTokens: null, images: null } : { aiTokens: num(s.customLimits?.aiTokens), images: num(s.customLimits?.images) },
+  };
+}
+
 // Annual plans get a small bonus — mirrors AiLimitsNotifier.monthlyTokenAllocation.
-function planTokenLimit(plan, cycle, limits) {
+// `customAiTokens` (admin-set per-company limit) wins over the plan table when present.
+function planTokenLimit(plan, cycle, limits, customAiTokens = null) {
+  if (customAiTokens !== null && customAiTokens !== undefined) return customAiTokens;
   const base = {
     basic: limits.basic_tokens_limit,
     standard: limits.standard_tokens_limit,
@@ -89,13 +110,15 @@ function estimateTokens(messages) {
 async function reserveTokens({ orgOwnerUid, plan, cycle, reserve, minimum = 1 }) {
   const { db, admin } = require('../config/firebase');
   const limits = await getAiLimitsConfig();
-  const planLimit = planTokenLimit(plan, cycle, limits);
   const userRef = db.collection('users').doc(orgOwnerUid);
   const usageRef = userRef.collection('ai').doc('usage');
   const curMonth = currentMonthKey();
 
   return db.runTransaction(async (tx) => {
     const [userSnap, usageSnap] = await Promise.all([tx.get(userRef), tx.get(usageRef)]);
+    // Limit from the owner's CURRENT subscription (expiry + admin overrides), not the caller's copy.
+    const eff = effectiveSubscription(userSnap.data()?.subscription);
+    const planLimit = planTokenLimit(eff.plan, eff.cycle, limits, eff.custom.aiTokens);
     const usage = usageSnap.exists ? usageSnap.data() : {};
     const addon = Number(userSnap.data()?.addonTokens || 0);
     const used = normalizeMonthKey(usage.lastResetMonth) === curMonth
@@ -110,9 +133,11 @@ async function reserveTokens({ orgOwnerUid, plan, cycle, reserve, minimum = 1 })
     const fromMonthly = Math.min(take, monthlyLeft);
     const fromAddon = take - fromMonthly;
 
+    const rolled = normalizeMonthKey(usage.lastResetMonth) !== curMonth;
     tx.set(usageRef, {
       tokensUsedThisMonth: used + fromMonthly,
       lastResetMonth: curMonth,
+      ...(rolled ? { imageGensThisMonth: 0 } : {}),   // stamping the new month must roll the image counter too
       addonTokensLeft: Math.max(0, addon - fromAddon),
       updatedAt: admin.firestore.FieldValue.serverTimestamp(),
     }, { merge: true });
@@ -133,13 +158,14 @@ async function settleTokens({ orgOwnerUid, plan, cycle, reservation, actual }) {
   const diff = actual - reservation.reserved; // >0 = owe more, <0 = refund
   if (diff === 0) return;
   const limits = await getAiLimitsConfig();
-  const planLimit = planTokenLimit(plan, cycle, limits);
   const userRef = db.collection('users').doc(orgOwnerUid);
   const usageRef = userRef.collection('ai').doc('usage');
   const curMonth = currentMonthKey();
   try {
     await db.runTransaction(async (tx) => {
       const [userSnap, usageSnap] = await Promise.all([tx.get(userRef), tx.get(usageRef)]);
+      const eff = effectiveSubscription(userSnap.data()?.subscription);
+      const planLimit = planTokenLimit(eff.plan, eff.cycle, limits, eff.custom.aiTokens);
       const usage = usageSnap.exists ? usageSnap.data() : {};
       let used = normalizeMonthKey(usage.lastResetMonth) === curMonth
         ? Number(usage.tokensUsedThisMonth || 0) : 0;
@@ -161,9 +187,11 @@ async function settleTokens({ orgOwnerUid, plan, cycle, reservation, actual }) {
         used = Math.max(0, used - refund);
       }
 
+      const rolled = normalizeMonthKey(usage.lastResetMonth) !== curMonth;
       tx.set(usageRef, {
         tokensUsedThisMonth: used,
         lastResetMonth: curMonth,
+        ...(rolled ? { imageGensThisMonth: 0 } : {}),
         addonTokensLeft: addon,
         updatedAt: admin.firestore.FieldValue.serverTimestamp(),
       }, { merge: true });
@@ -184,17 +212,19 @@ async function resolveOrgBilling(uid) {
   const userSnap = await db.collection('users').doc(uid).get();
   if (!userSnap.exists) return null;
   const u = userSnap.data();
-  const orgOwnerUid = (u.isEmployee && u.adminId) ? u.adminId : uid;
+  // Employees created by routes/employees.js are marked role:'employee' (older ones isEmployee:true).
+  const orgOwnerUid = ((u.isEmployee || u.role === 'employee') && u.adminId) ? u.adminId : uid;
   const ownerSnap = orgOwnerUid === uid ? userSnap : await db.collection('users').doc(orgOwnerUid).get();
   if (!ownerSnap.exists) return null;
-  const sub = ownerSnap.data().subscription || {};
-  return { uid, orgOwnerUid, plan: sub.plan || 'basic', cycle: sub.cycle || 'monthly' };
+  const eff = effectiveSubscription(ownerSnap.data().subscription);
+  return { uid, orgOwnerUid, plan: eff.plan, cycle: eff.cycle, customLimits: eff.custom };
 }
 
 // Plan gating written by the admin panel (appConfig/planGating). Used so the
 // server enforces the SAME rules the app shows, instead of a hard-coded copy.
 const PLAN_ORDER = ['basic', 'standard', 'premium'];
-const DEFAULT_SCREEN_ACCESS = { image_studio: 'standard', ai_chat: 'standard', website_studio: 'standard', app_studio: 'standard' };
+// Only a FALLBACK for when the admin panel hasn't saved a value for the feature yet (mirrors the app's defaults).
+const DEFAULT_SCREEN_ACCESS = { image_studio: 'standard', ai_chat: 'standard', website_studio: 'standard', app_studio: 'standard', team_chat: 'standard' };
 
 async function canAccessFeature(featureKey, plan) {
   const { db } = require('../config/firebase');
@@ -210,5 +240,5 @@ async function canAccessFeature(featureKey, plan) {
 module.exports = {
   AI_CHAT_PROVIDERS, GROK_API_KEY, OPENAI_API_KEY, GROK_IMAGE_URL,
   currentMonthKey, normalizeMonthKey, getAiLimitsConfig, getImageLimitsConfig,
-  planTokenLimit, estimateTokens, reserveTokens, settleTokens, canAccessFeature, resolveOrgBilling,
+  planTokenLimit, effectiveSubscription, estimateTokens, reserveTokens, settleTokens, canAccessFeature, resolveOrgBilling,
 };
