@@ -223,7 +223,7 @@ router.get('/paypal/capture-product-order', async (req, res) => {
 router.get('/paypal/order-status', requireAuth, async (req, res) => {
   // Product orders live in their own collections; plan + AI-token orders
   // share the 'orders' collection (kind = 'plan' | 'token').
-  const collections = { website: PRODUCTS.website.collection, app: PRODUCTS.app.collection, whatsapp: PRODUCTS.whatsapp.collection, voice: PRODUCTS.voice.collection, plan: 'orders', token: 'orders' };
+  const collections = { website: PRODUCTS.website.collection, app: PRODUCTS.app.collection, whatsapp: PRODUCTS.whatsapp.collection, voice: PRODUCTS.voice.collection, plan: 'orders', token: 'orders', image: 'orders' };
   const collection = collections[req.query.kind];
   if (!collection || !req.query.orderId) return res.status(400).json({ error: 'kind and orderId are required.' });
   const snap = await db.collection(collection).doc(String(req.query.orderId)).get();
