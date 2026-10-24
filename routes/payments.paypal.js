@@ -6,7 +6,8 @@ const axios = require('axios');
 const { v4: uuidv4 } = require('uuid');
 const { admin, db } = require('../config/firebase');
 const { PP_ENV, PP_CLIENT_ID, PP_BASE_URL, getPayPalAccessToken, ppHeaders } = require('../services/paypal');
-const { getCanonicalPrice, getPaypalUsd, getPaypalTokenPack } = require('../services/pricing');
+const { getCanonicalPrice, getPaypalUsd, getPaypalTokenPack, getPaypalImagePack } = require('../services/pricing');
+const { resolveOrgBilling } = require('../services/ai');
 const { requireAuth } = require('../middleware/auth');
 const { rateLimit } = require('../middleware/rateLimit');
 const { SERVER_BASE_URL } = require('../config/env');
@@ -310,6 +311,102 @@ router.get('/paypal/capture-token-order', async (req, res) => {
   } catch (err) {
     const msg = err?.response?.data?.message || err.message || 'Token capture failed.';
     console.error('paypal/capture-token-order error:', err?.response?.data || err.message);
+    return res.status(500).json({ error: msg });
+  }
+});
+
+// ─────────────────────────────────────────────────────────────────────────
+// POST /paypal/create-image-order — Image Studio top-up (USD). Price + pack size
+// come from Firestore (admin panel), never from the client.
+// ─────────────────────────────────────────────────────────────────────────
+router.post('/paypal/create-image-order', requireAuth, rateLimit({ windowMs: 60_000, max: 10, keyFn: r => `pp-create-image-order:${r.uid}` }), async (req, res) => {
+  try {
+    const { imagePacks, userEmail } = req.body;
+    const uid = req.uid;
+    const packs = parseInt(imagePacks, 10);
+    if (!packs || packs < 1 || packs > 100) return res.status(400).json({ error: 'imagePacks must be 1–100.' });
+    if (!userEmail) return res.status(400).json({ error: 'userEmail is required.' });
+
+    const pack = await getPaypalImagePack();
+    const amountUSD = Math.round(pack.priceUSD * packs * 100) / 100;
+    const imagesToAdd = pack.imagesPerPack * packs;
+    if (amountUSD < MIN_PAYPAL_USD) {
+      const minPacks = Math.ceil(MIN_PAYPAL_USD / pack.priceUSD);
+      return res.status(400).json({
+        error: `Amount too small for PayPal ($${amountUSD.toFixed(2)}). Minimum is $${MIN_PAYPAL_USD.toFixed(2)} - buy at least ${minPacks} pack${minPacks > 1 ? 's' : ''}, or use Cashfree instead.`,
+      });
+    }
+
+    const token = await getPayPalAccessToken();
+    const orderId = `PPIMG_${uid.substring(0, 6)}_${uuidv4().replace(/-/g, '').substring(0, 8)}`.toUpperCase();
+    const ppPayload = {
+      intent: 'CAPTURE',
+      purchase_units: [{
+        reference_id: orderId,
+        description: `${imagesToAdd} Image Studio images (${packs} pack${packs > 1 ? 's' : ''})`,
+        amount: { currency_code: 'USD', value: amountUSD.toFixed(2) },
+        custom_id: JSON.stringify({ uid, imagePacks: packs, internalOrderId: orderId }),
+      }],
+      application_context: {
+        brand_name: 'Astric', user_action: 'PAY_NOW',
+        return_url: `${SERVER_BASE_URL}/paypal/capture-image-order?internalOrderId=${orderId}`,
+        cancel_url: `${SERVER_BASE_URL}/paypal/cancel?orderId=${orderId}`,
+      },
+    };
+    const ppRes = await axios.post(`${PP_BASE_URL}/v2/checkout/orders`, ppPayload, { headers: ppHeaders(token) });
+    const ppOrderId = ppRes.data.id;
+    const approveUrl = ppRes.data.links?.find(l => l.rel === 'approve')?.href;
+    if (!approveUrl) return res.status(500).json({ error: 'PayPal did not return an approve URL.' });
+
+    // Credit goes to the ORG OWNER's pool (employees share the owner's images).
+    const billing = await resolveOrgBilling(uid);
+    const orgOwnerUid = billing?.orgOwnerUid || uid;
+    await db.collection('orders').doc(orderId).set({
+      orderId, uid, orgOwnerUid, userEmail, orderType: 'images', imagePacks: packs, imagesToAdd, amountUSD,
+      gateway: 'paypal', ppOrderId, status: 'pending', environment: PP_ENV,
+      createdAt: admin.firestore.FieldValue.serverTimestamp(),
+    });
+    return res.status(200).json({ paypalOrderId: ppOrderId, internalOrderId: orderId, approveUrl, amountUSD, imagesToAdd, environment: PP_ENV });
+  } catch (err) {
+    const msg = extractPaypalError(err) || 'PayPal image order failed.';
+    console.error('paypal/create-image-order error:', err?.response?.data || err.message);
+    return res.status(500).json({ error: msg });
+  }
+});
+
+// GET /paypal/capture-image-order — PayPal redirects here after approval.
+router.get('/paypal/capture-image-order', async (req, res) => {
+  const { token: ppOrderId, internalOrderId } = req.query;
+  if (!ppOrderId || !internalOrderId) return res.status(400).json({ error: 'Missing required query params.' });
+  try {
+    const orderRef = db.collection('orders').doc(internalOrderId);
+    const orderSnap = await orderRef.get();
+    if (!orderSnap.exists) return res.status(404).json({ error: 'Order not found.' });
+    const o = orderSnap.data();
+    if (o.orderType !== 'images') return res.status(400).json({ error: 'Not an image order.' });
+    if (o.status === 'paid') return res.status(200).json({ success: true, alreadyCredited: true, imagesAdded: o.imagesToAdd });
+    if (o.ppOrderId !== ppOrderId) return res.status(400).json({ error: 'Order/token mismatch.' });
+
+    const accessToken = await getPayPalAccessToken();
+    const captureRes = await axios.post(`${PP_BASE_URL}/v2/checkout/orders/${ppOrderId}/capture`, {}, { headers: ppHeaders(accessToken) });
+    const captureStatus = captureRes.data.status;
+    const captureId = captureRes.data.purchase_units?.[0]?.payments?.captures?.[0]?.id;
+    if (captureStatus !== 'COMPLETED') {
+      await orderRef.update({ status: 'capture_failed', ppCaptureStatus: captureStatus });
+      return res.status(400).json({ error: `Capture status: ${captureStatus}` });
+    }
+    // Image count from OUR stored order, never from the query string.
+    await db.runTransaction(async (tx) => {
+      const fresh = await tx.get(orderRef);
+      if (fresh.exists && fresh.data().status === 'paid') return;
+      tx.update(orderRef, { status: 'paid', ppCaptureId: captureId, ppCaptureStatus: captureStatus, activatedAt: admin.firestore.FieldValue.serverTimestamp() });
+      tx.set(db.collection('users').doc(o.orgOwnerUid || o.uid), { addonImages: admin.firestore.FieldValue.increment(o.imagesToAdd) }, { merge: true });
+    });
+    console.log(`PayPal images added: uid=${o.uid} images=${o.imagesToAdd} captureId=${captureId}`);
+    return res.status(200).json({ success: true, imagesAdded: o.imagesToAdd, captureId });
+  } catch (err) {
+    const msg = err?.response?.data?.message || err.message || 'Image capture failed.';
+    console.error('paypal/capture-image-order error:', err?.response?.data || err.message);
     return res.status(500).json({ error: msg });
   }
 });

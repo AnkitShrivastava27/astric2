@@ -68,6 +68,8 @@ async function memberContext(uid) {
   const isEmployee = u.role === 'employee' && !!u.adminId;
   return { uid, orgId: isEmployee ? u.adminId : uid, isAdmin: !isEmployee, user: u };
 }
+// Employees may use every capture method (webhook/QR/Facebook/imports). Only rotating the org's
+// keys stays admin-only, because it invalidates every existing integration for the whole organisation.
 async function adminContext(uid) {
   const c = await memberContext(uid);
   if (!c.isAdmin) { const e = new Error('Only the organisation admin can do this.'); e.status = 403; throw e; }
@@ -115,7 +117,7 @@ async function finishImport(orgId, prep, result) {
 // App endpoints
 // ─────────────────────────────────────────────────────────────────────────────
 router.get('/capture/config', requireAuth, guard(async (req, res) => {
-  const { orgId } = await adminContext(req.uid);
+  const { orgId } = await memberContext(req.uid);
   const s = await getSecrets(orgId, { create: true });
   const u = urls(orgId, s);
   const qr = await QRCode.toDataURL(u.formUrl, { margin: 1, width: 480, errorCorrectionLevel: 'M' });
@@ -140,7 +142,7 @@ router.post('/capture/rotate', requireAuth, rateLimit({ windowMs: 60_000, max: 6
 
 router.post('/capture/test', requireAuth, rateLimit({ windowMs: 60_000, max: 6, keyFn: (r) => `cap-test:${r.uid}` }),
   guard(async (req, res) => {
-    const { orgId, uid } = await adminContext(req.uid);
+    const { orgId, uid } = await memberContext(req.uid);
     const stamp = Date.now();
     const r = await ingestLead(orgId, mapFields({
       name: 'Test Lead (safe to delete)', email: `test+${stamp}@example.com`, company: 'Astric capture test',
@@ -151,7 +153,7 @@ router.post('/capture/test', requireAuth, rateLimit({ windowMs: 60_000, max: 6, 
 
 router.post('/capture/defaults', requireAuth, rateLimit({ windowMs: 60_000, max: 12, keyFn: (r) => `cap-def:${r.uid}` }),
   guard(async (req, res) => {
-    const { orgId } = await adminContext(req.uid);
+    const { orgId } = await memberContext(req.uid);
     const products = await loadProducts(orgId);
     const upd = {};
     for (const [bodyKey, field] of [['webhookProductId', 'defaultProductWebhook'], ['facebookProductId', 'defaultProductFacebook']]) {
@@ -166,7 +168,7 @@ router.post('/capture/defaults', requireAuth, rateLimit({ windowMs: 60_000, max:
   }));
 
 router.post('/capture/qr', requireAuth, guard(async (req, res) => {
-  const { orgId } = await adminContext(req.uid);
+  const { orgId } = await memberContext(req.uid);
   const s = await getSecrets(orgId, { create: true });
   const productId = String((req.body || {}).productId || '').trim();
   let url = urls(orgId, s).formUrl;
@@ -227,7 +229,7 @@ router.post('/capture/sheets/import', requireAuth, rateLimit({ windowMs: 60_000,
 
 router.post('/capture/facebook', requireAuth, rateLimit({ windowMs: 60_000, max: 6, keyFn: (r) => `cap-fb:${r.uid}` }),
   guard(async (req, res) => {
-    const { orgId } = await adminContext(req.uid);
+    const { orgId } = await memberContext(req.uid);
     const pageToken = String((req.body || {}).pageToken || '').trim();
     const appSecret = String((req.body || {}).appSecret || '').trim();
     if (!pageToken || !appSecret) return res.status(400).json({ error: 'Both the Page access token and the App secret are required.' });
