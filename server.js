@@ -75,6 +75,7 @@ app.use(require('./routes/billing-history'));
 app.use(require('./routes/employees'));
 app.use(require('./routes/chat'));
 app.use(require('./routes/leadCapture'));
+app.use(require('./routes/booking'));
 
 const env = require('./config/env');
 const { CF_BASE_URL } = require('./services/cashfree');
