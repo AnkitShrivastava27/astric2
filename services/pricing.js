@@ -69,30 +69,4 @@ async function getPaypalTokenPack() {
   return { priceUSD: await inrToUsd(inr), tokensPerPack: 10000, custom: false };
 }
 
-// ── Image top-up packs (Image Studio) ───────────────────────────────────────
-// Admin sets, in pricing_config/plans (via POST /update-pricing):
-//   image_pack_price (INR per pack)  +  image_pack_size (images per pack).
-// e.g. image_pack_price=50, image_pack_size=10  ->  "Rs 50 for 10 images".
-async function getImagePack() {
-  const data = await getPlansDoc();
-  const price = Number(data.image_pack_price);
-  const size  = parseInt(data.image_pack_size, 10);
-  return {
-    price: price > 0 ? price : 50,
-    size:  size  > 0 ? size  : 10,
-    configured: price > 0 && size > 0,
-  };
-}
-
-// USD image pack for PayPal: { priceUSD, imagesPerPack, custom }. Admin sets
-// paypal_image_pack_price (USD) + paypal_image_pack_size; otherwise the INR pack is converted.
-async function getPaypalImagePack() {
-  const data = await getPlansDoc();
-  const price = Number(data.paypal_image_pack_price);
-  const size  = parseInt(data.paypal_image_pack_size, 10);
-  if (price > 0 && size > 0) return { priceUSD: Math.round(price * 100) / 100, imagesPerPack: size, custom: true };
-  const inr = await getImagePack();
-  return { priceUSD: await inrToUsd(inr.price), imagesPerPack: inr.size, custom: false };
-}
-
-module.exports = { getPaypalImagePack, getImagePack, inrToUsd, getCanonicalPrice, getTokenPackPrice, getPaypalUsd, getPaypalTokenPack };
+module.exports = { inrToUsd, getCanonicalPrice, getTokenPackPrice, getPaypalUsd, getPaypalTokenPack };

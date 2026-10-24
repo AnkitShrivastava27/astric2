@@ -108,46 +108,33 @@ router.post('/ai/image', requireAuth, rateLimit({ windowMs: 60_000, max: 10, key
     const planImageLimit = billing.customLimits?.images ?? tableLimit;
 
     const usageRef = db.collection('users').doc(orgOwnerUid).collection('ai').doc('usage');
-    const ownerRef = db.collection('users').doc(orgOwnerUid);
     const curMonth = currentMonthKey();
 
     // RESERVE the image first, atomically — two parallel requests can no longer both slip under the
-    // cap. Order of use: (1) the plan's monthly images, then (2) purchased top-up images
-    // (users/{owner}.addonImages, which never expire). Refunded to whichever pool it came from if the model fails.
+    // cap (the old code checked, called the model, and only then counted). Refunded if the model fails.
     const reservation = await db.runTransaction(async (tx) => {
-      const [snap, ownerSnap] = await Promise.all([tx.get(usageRef), tx.get(ownerRef)]);
+      const snap = await tx.get(usageRef);
       const d = snap.exists ? snap.data() : {};
-      const addon = Math.max(0, Number((ownerSnap.exists ? ownerSnap.data() : {}).addonImages || 0));
       const rolled = normalizeMonthKey(d.lastResetMonth) !== curMonth;
       const used = rolled ? 0 : Number(d.imageGensThisMonth || 0);
-      const roll = rolled ? { tokensUsedThisMonth: 0 } : {};  // stamping the new month rolls the token counter too
-      if (used < planImageLimit) {
-        tx.set(usageRef, {
-          imageGensThisMonth: used + 1, lastResetMonth: curMonth, ...roll,
-          updatedAt: admin.firestore.FieldValue.serverTimestamp(),
-        }, { merge: true });
-        return { ok: true, used: used + 1, from: 'plan' };
-      }
-      if (addon > 0) {
-        tx.set(ownerRef, { addonImages: admin.firestore.FieldValue.increment(-1) }, { merge: true });
-        if (rolled) tx.set(usageRef, { imageGensThisMonth: 0, lastResetMonth: curMonth, ...roll }, { merge: true });
-        return { ok: true, used, from: 'addon' };
-      }
-      return { ok: false, used };
+      if (used >= planImageLimit) return { ok: false, used };
+      tx.set(usageRef, {
+        imageGensThisMonth: used + 1, lastResetMonth: curMonth,
+        // new month: the token counter must roll over too, since we are about to stamp the new month
+        ...(rolled ? { tokensUsedThisMonth: 0 } : {}),
+        updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+      }, { merge: true });
+      return { ok: true, used: used + 1 };
     });
     if (!reservation.ok) {
       return res.status(402).json({
         error: planImageLimit > 0
           ? `Your organisation has used all ${planImageLimit} image generations for this month.`
           : 'Image generation is not included in your current plan.',
-        limitReached: true, outOf: 'images', canBuyMore: true, limit: planImageLimit, used: reservation.used,
+        limitReached: true, limit: planImageLimit, used: reservation.used,
       });
     }
     const refundImage = () => db.runTransaction(async (tx) => {
-      if (reservation.from === 'addon') {
-        tx.set(ownerRef, { addonImages: admin.firestore.FieldValue.increment(1) }, { merge: true });
-        return;
-      }
       const snap = await tx.get(usageRef);
       const d = snap.exists ? snap.data() : {};
       if (normalizeMonthKey(d.lastResetMonth) !== curMonth) return;

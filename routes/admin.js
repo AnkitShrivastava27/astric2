@@ -16,8 +16,6 @@ router.post('/update-pricing', requireAdmin, adminLimit, async (req, res) => {
     const priceFields = [
       'basic_monthly', 'basic_annual', 'standard_monthly', 'standard_annual',
       'premium_monthly', 'premium_annual', 'token_pack_price',
-      // Image Studio top-up pack: INR price per pack (images per pack = image_pack_size below).
-      'image_pack_price', 'paypal_image_pack_price',
       // NOTE: these three were already sent by the admin panel
       // (client/src/pages/Pricing.jsx) and already read by
       // routes/website-credits.js, but were missing from THIS whitelist —
@@ -58,17 +56,6 @@ router.post('/update-pricing', requireAdmin, adminLimit, async (req, res) => {
       const n = Number(req.body.paypal_token_pack_size);
       if (!Number.isInteger(n) || n < 0) return res.status(400).json({ error: 'paypal_token_pack_size must be a whole number (0 to clear).' });
       update.paypal_token_pack_size = n;
-    }
-    // Images per top-up pack - whole number (e.g. Rs 50 -> 10 images).
-    if (req.body.image_pack_size !== undefined) {
-      const n = Number(req.body.image_pack_size);
-      if (!Number.isInteger(n) || n < 1) return res.status(400).json({ error: 'image_pack_size must be a whole number of at least 1.' });
-      update.image_pack_size = n;
-    }
-    if (req.body.paypal_image_pack_size !== undefined) {
-      const n = Number(req.body.paypal_image_pack_size);
-      if (!Number.isInteger(n) || n < 0) return res.status(400).json({ error: 'paypal_image_pack_size must be a whole number (0 to clear).' });
-      update.paypal_image_pack_size = n;
     }
     // Voice minutes are whole numbers; the trial-once switch is 0 or 1.
     for (const key of ['voice_trial_minutes', 'voice_pack_minutes']) {
