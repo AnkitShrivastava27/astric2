@@ -35,6 +35,7 @@ const { requireAuth } = require('../middleware/auth');
 const { rateLimit } = require('../middleware/rateLimit');
 const { csvToObjects } = require('../services/csvParse');
 const { mapFields, ingestLead, ingestMany, notifyNewLead, loadProducts, applyProduct, createBatch, deleteBatch } = require('../services/leadIngest');
+const { fetchSheetCsv, SheetError } = require('../services/sheetFetch');
 
 const GRAPH = `https://graph.facebook.com/${process.env.META_GRAPH_VERSION || 'v19.0'}`;
 const urlencoded = express.urlencoded({ extended: true, limit: '200kb' });
@@ -199,24 +200,12 @@ router.post('/capture/import', requireAuth, rateLimit({ windowMs: 60_000, max: 1
 router.post('/capture/sheets/import', requireAuth, rateLimit({ windowMs: 60_000, max: 6, keyFn: (r) => `cap-sh:${r.uid}` }),
   guard(async (req, res) => {
     const { orgId, uid } = await memberContext(req.uid);
-    const url = String((req.body || {}).url || '').trim();
-    const id = (url.match(/\/spreadsheets\/d\/([a-zA-Z0-9_-]+)/) || [])[1];
-    if (!id) return res.status(400).json({ error: 'That doesn\'t look like a Google Sheets link.' });
-    const gid = (url.match(/[#&?]gid=(\d+)/) || [])[1] || '0';
     let body;
     try {
-      const r = await axios.get(`https://docs.google.com/spreadsheets/d/${id}/export`, {
-        params: { format: 'csv', gid }, responseType: 'text', timeout: 20_000, maxContentLength: 5 * 1024 * 1024,
-        transformResponse: (d) => d, validateStatus: () => true, maxRedirects: 5,
-      });
-      body = r.data;
-      const looksHtml = /^\s*<(!doctype|html)/i.test(String(body));
-      if (r.status === 404) return res.status(400).json({ error: 'Sheet not found. Check the link.' });
-      if (r.status !== 200 || looksHtml) {
-        return res.status(400).json({ error: 'Google wouldn\'t let us read this sheet. Click Share → General access → "Anyone with the link" → Viewer, then try again.' });
-      }
+      body = (await fetchSheetCsv((req.body || {}).url)).csv;
     } catch (e) {
-      return res.status(502).json({ error: 'Could not reach Google Sheets. Try again in a moment.' });
+      if (e instanceof SheetError) return res.status(e.code === 'network' ? 502 : 400).json({ error: e.message, reason: e.code });
+      throw e;
     }
     const { headers, records } = csvToObjects(body);
     const known = headers.map((h) => mapFields({ [h]: 'x' })).some((m) => m.name || m.first || m.email || m.phone);

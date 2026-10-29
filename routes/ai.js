@@ -12,6 +12,9 @@ const {
   estimateTokens, reserveTokens, settleTokens, canAccessFeature, resolveOrgBilling,
 } = require('../services/ai');
 const { DEFAULT_AI_LIMITS } = require('../config/env');
+const { webSearch, needsWebSearch, queryFrom, formatForModel } = require('../services/webSearch');
+
+const textOf = (m) => (typeof m?.content === 'string' ? m.content : Array.isArray(m?.content) ? m.content.map((p) => p?.text || '').join(' ') : '');
 
 // =============================================================================
 // POST /ai/chat
@@ -23,7 +26,8 @@ router.post('/ai/chat', requireAuth, rateLimit({ windowMs: 60_000, max: 30, keyF
   let reservation = null;
   let billing = null;
   try {
-    const { provider, model, messages, maxTokens, maxCompletionTokens, temperature, useCompletionTokens } = req.body;
+    const { provider, model, maxTokens, maxCompletionTokens, temperature, useCompletionTokens, webSearch: webMode } = req.body;
+    let messages = req.body.messages;
     const uid = req.uid;
 
     const cfg = AI_CHAT_PROVIDERS[provider];
@@ -35,6 +39,25 @@ router.post('/ai/chat', requireAuth, rateLimit({ windowMs: 60_000, max: 30, keyF
 
     billing = await resolveOrgBilling(uid);
     if (!billing) return res.status(404).json({ error: 'User not found.' });
+
+    // ── Real-time information (DuckDuckGo). webSearch: true = always, 'auto' (default) = only when the question looks
+    // like it needs current info, false = never. A failed search never fails the chat: it just answers without it.
+    let sources = [];
+    let searched = false;
+    const mode = webMode === undefined ? 'auto' : webMode;
+    if (mode) {
+      const lastIdx = (() => { for (let i = messages.length - 1; i >= 0; i--) if (messages[i]?.role === 'user') return i; return -1; })();
+      const userText = lastIdx >= 0 ? textOf(messages[lastIdx]) : '';
+      if (userText && (mode === true || mode === 'true' || needsWebSearch(userText))) {
+        const q = queryFrom(userText);
+        const found = await webSearch(q, { recency: /\b(today|latest|news|breaking|now|tonight)\b/i.test(userText) ? 'week' : '' });
+        searched = true;
+        if (found.results.length) {
+          sources = found.results.map((r) => ({ title: r.title, url: r.url }));
+          messages = [...messages.slice(0, lastIdx), { role: 'system', content: formatForModel(q, found.results) }, ...messages.slice(lastIdx)];
+        }
+      }
+    }
 
     // Cap the model's answer so one long reply can't blow far past the
     // quota. (The old code only checked "used >= limit" BEFORE the call, so
@@ -67,7 +90,7 @@ router.post('/ai/chat', requireAuth, rateLimit({ windowMs: 60_000, max: 30, keyF
     await settleTokens({ ...billing, reservation, actual: tokensConsumed });
     reservation = null;
 
-    return res.status(200).json({ reply, tokensConsumed });
+    return res.status(200).json({ reply, tokensConsumed, ...(sources.length ? { sources } : {}), ...(searched ? { searched: true } : {}) });
   } catch (err) {
     // Upstream failed → give the reserved tokens back; the user got nothing.
     if (reservation) await settleTokens({ ...billing, reservation, actual: 0 });
