@@ -192,16 +192,21 @@ async function ingestLead(orgId, f, { createdBy = '', defaultSource = 'websiteFo
 }
 
 /** Many rows, a few at a time. rows: array of plain objects (any field naming). */
-async function ingestMany(orgId, rows, opts, { max = 5000, concurrency = 8 } = {}) {
+async function ingestMany(orgId, rows, opts, { max = 5000, concurrency = 8, onProgress = null } = {}) {
   const result = { created: 0, duplicates: 0, invalid: 0, unmatchedProducts: 0, errors: [] };
   const products = await loadProducts(orgId);
   const list = rows.slice(0, max);
+  // Rows are written several at a time, so two rows with the same phone could both pass the "already exists" check
+  // before either is saved. Catch repeats inside the file up front (first one wins) — this check is synchronous.
+  const seenPhones = new Set();
   if (rows.length > max) result.errors.push(`Only the first ${max} rows were processed.`);
   for (let i = 0; i < list.length; i += concurrency) {
     await Promise.all(list.slice(i, i + concurrency).map(async (raw, j) => {
       const rowNo = i + j + 2;                       // +2: row 1 is the header
       try {
         const f = mapFields(raw);
+        const pn = normalizePhone(f.phone || '');
+        if (pn && pn.length >= 8) { if (seenPhones.has(pn)) { result.duplicates++; return; } seenPhones.add(pn); }
         // A "product" column in the file wins for that row when it matches one of your products;
         // otherwise the product chosen for the whole import is used.
         const pr = applyProduct(f, products, { id: opts.productId, name: opts.productName });
@@ -215,6 +220,7 @@ async function ingestMany(orgId, rows, opts, { max = 5000, concurrency = 8 } = {
         if (result.errors.length < 25) result.errors.push(`Row ${rowNo}: ${e.message}`);
       }
     }));
+    if (onProgress) { try { await onProgress({ ...result, errors: result.errors.slice() }, Math.min(i + concurrency, list.length), list.length); } catch (_) { /* progress is best-effort */ } }
   }
   return result;
 }

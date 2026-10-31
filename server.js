@@ -33,6 +33,15 @@
  *  -- OAuth state signing (optional, falls back to ADMIN_API_KEY) ------------
  *  OAUTH_STATE_SECRET
  *
+ *  -- Secret encryption (REQUIRED before storing any user API key) ------------
+ *  SECRETS_ENCRYPTION_KEY     — 32 random bytes: `openssl rand -hex 32`. Never change it without
+ *                               setting SECRETS_ENCRYPTION_KEY_PREV to the old value (key rotation).
+ *
+ *  -- Google (Contacts / Drive / Calendar) --------------------------------
+ *  Nothing is required here: each company enters ITS OWN Google OAuth Client ID + Secret in the app
+ *  (Integrations → Google). GOOGLE_CLIENT_ID / GOOGLE_CLIENT_SECRET are only an optional fallback for a
+ *  company that has not set its own.
+ *
  *  -- Deep link back into the app after OAuth connect (optional) -------------
  *  APP_DEEPLINK_SCHEME        — defaults to "biznexus"
  *
@@ -76,6 +85,8 @@ app.use(require('./routes/employees'));
 app.use(require('./routes/chat'));
 app.use(require('./routes/leadCapture'));
 app.use(require('./routes/booking'));
+app.use(require('./routes/secrets'));
+app.use(require('./routes/google'));
 
 const env = require('./config/env');
 const { CF_BASE_URL } = require('./services/cashfree');

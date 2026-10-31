@@ -26,6 +26,10 @@
 const axios = require('axios');
 const { db } = require('../config/firebase');
 const { HUBSPOT_CLIENT_ID, HUBSPOT_CLIENT_SECRET } = require('../config/env');
+const { encryptFields, decryptFields } = require('./secretBox');
+
+// Fields that are secrets: stored encrypted (AES-256-GCM), decrypted only here on the server.
+const SECRET_FIELDS = ['clientSecret', 'accessToken', 'refreshToken'];
 
 function connectedChannelRef(uid, provider) {
   return db.collection('users').doc(uid).collection('connectedChannels').doc(provider);
@@ -121,7 +125,7 @@ async function getValidAccessToken(uid, provider) {
   const ref = connectedChannelRef(uid, provider);
   const snap = await ref.get();
   if (!snap.exists) return null;
-  const data = snap.data();
+  const data = decryptFields(snap.data(), SECRET_FIELDS);
 
   const stillValid = data.expiresAt && Date.now() < data.expiresAt - 60_000;
   if (stillValid) {
@@ -151,13 +155,13 @@ async function getValidAccessToken(uid, provider) {
     expiresAt: Date.now() + (tokens.expires_in || 3600) * 1000,
   };
   if (tokens.instance_url) update.instanceUrl = tokens.instance_url;
-  await ref.set(update, { merge: true });
+  await ref.set(encryptFields(update, SECRET_FIELDS), { merge: true });
 
   return { accessToken: update.accessToken, instanceUrl: update.instanceUrl || data.instanceUrl, realmId: data.realmId };
 }
 
 module.exports = {
-  connectedChannelRef,
+  connectedChannelRef, SECRET_FIELDS,
   exchangeHubspotCode, refreshHubspotToken,
   exchangeSalesforceCode, refreshSalesforceToken,
   exchangeQuickBooksCode, refreshQuickBooksToken,

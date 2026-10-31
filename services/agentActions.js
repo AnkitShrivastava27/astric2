@@ -172,6 +172,7 @@ async function matchLeads(ctx, filter, { onlyUnbatched = false } = {}) {
   let skippedBatched = 0;
   snap.forEach((d) => {
     const l = d.data();
+    if (!canSee(ctx, l)) return;
     if (f.priority && l.priority !== f.priority) return;
     if (f.source && l.source !== f.source) return;
     if (batchId && l.batchId !== batchId) return;
@@ -182,6 +183,48 @@ async function matchLeads(ctx, filter, { onlyUnbatched = false } = {}) {
   });
   return { rows, skippedBatched, filter: f, scanned: snap.size, truncated: snap.size >= MAX_SCAN };
 }
+
+// ── who may see what ─────────────────────────────────────────────────────────────────────────────────────
+// Same rule as the app / Firestore rules: the admin sees every lead; an employee only the leads shared with them.
+const canSee = (ctx, l) => !ctx.isEmployee || (Array.isArray(l.visibleTo) && l.visibleTo.includes(ctx.uid)) || l.createdBy === ctx.uid;
+
+const iso = (v) => { const d = toDate(v); return d && !Number.isNaN(d.getTime()) ? d.toISOString() : ''; };
+const day = (v) => iso(v).slice(0, 10);
+
+/** One lead by id, name, phone or email. Several matches -> an error that lists them so the user can pick. */
+async function findLead(ctx, a) {
+  a = a || {};
+  if (a.leadId) {
+    const s = await orgRef(ctx).collection('leads').doc(String(a.leadId)).get();
+    if (s.exists && canSee(ctx, s.data())) return { id: s.id, ...s.data() };
+  }
+  const q = clip(a.leadName || a.name || a.phone || a.email || a.search || '', 80).trim();
+  if (!q) throw new Error('Tell me which lead (a name, phone number or email).');
+  const { rows } = await matchLeads(ctx, { search: q });
+  if (!rows.length) throw new Error(`I couldn't find a lead matching "${q}".`);
+  const exact = rows.filter((l) => norm(l.name) === norm(q) || norm(l.email) === norm(q) || (digits(q).length >= 6 && digits(l.phone).endsWith(digits(q).slice(-10))));
+  if (exact.length === 1) return exact[0];
+  if (rows.length === 1) return rows[0];
+  throw new Error(`"${q}" matches ${rows.length} leads: ${rows.slice(0, 5).map((l) => `${l.name}${l.phone ? ` (${l.phone})` : ''}`).join(', ')}${rows.length > 5 ? '…' : ''}. Which one? Give the phone number or full name.`);
+}
+async function findCustomer(ctx, a) {
+  a = a || {};
+  const q = clip(a.customerName || a.name || a.phone || a.email || a.search || '', 80).trim();
+  if (!q) throw new Error('Tell me which customer (a name, phone number or email).');
+  const all = await loadAll(orgRef(ctx).collection('customers'), 1000);
+  const n = norm(q), d = digits(q);
+  const rows = all.filter((c) => norm(c.name).includes(n) || norm(c.email) === n || (d.length >= 6 && digits(c.phone).endsWith(d.slice(-10))));
+  if (!rows.length) throw new Error(`I couldn't find a customer matching "${q}".`);
+  const exact = rows.filter((c) => norm(c.name) === n);
+  if (exact.length === 1) return exact[0];
+  if (rows.length === 1) return rows[0];
+  throw new Error(`"${q}" matches ${rows.length} customers: ${rows.slice(0, 5).map((c) => c.name).join(', ')}. Which one?`);
+}
+const recentActivities = (arr, n = 8) => (Array.isArray(arr) ? arr : []).map((a) => ({ type: a.type || 'note', note: clip(a.note, 240), by: a.createdBy || '', at: iso(a.createdAt) }))
+  .sort((x, y) => String(y.at).localeCompare(String(x.at))).slice(0, n);
+const taskBrief = (t) => ({ title: t.title, status: t.status, priority: t.priority, assignedTo: t.assignedTo || '', due: day(t.deadline), overdue: !!(toDate(t.deadline) && toDate(t.deadline) < new Date() && t.status !== 'done') });
+const nameOfBatch = async (ctx, id) => { if (!id) return ''; const b = (await batches(ctx)).find((x) => x.id === id); return b ? b.name : ''; };
+
 const leadBrief = (l) => ({
   id: l.id, name: l.name, phone: l.phone || '', email: l.email || '', company: l.company || '', stage: l.stage, priority: l.priority,
   source: l.source, createdAt: toDate(l.createdAt) ? toDate(l.createdAt).toISOString().slice(0, 10) : '', inBatch: !!l.batchId,
@@ -202,6 +245,15 @@ const READ_TOOLS = [
   fn('business_snapshot', 'Current numbers: leads per status, tasks by status, customers, employees, meetings today, voice minutes left. Use for "how are we doing" / "summary".'),
   fn('list_items', 'List names of things in the workspace so you can refer to them exactly.',
     { kind: { type: 'string', enum: ['employees', 'teams', 'batches', 'voice_products'] } }, ['kind']),
+  fn('get_lead_details', 'Everything about ONE lead: contact details, status, priority, source, product, batch, estimated value, notes, recent activity and follow-ups. Use when the user asks about a specific lead/person ("tell me about Ravi", "what happened with the Sharma lead", "what is X\'s number").',
+    { leadName: { type: 'string' }, phone: { type: 'string' }, email: { type: 'string' }, leadId: { type: 'string' } }),
+  fn('get_customer_details', 'Everything about ONE customer: contact details, notes, recent activity, linked projects and invoices.', { customerName: { type: 'string' }, phone: { type: 'string' }, email: { type: 'string' } }),
+  fn('find_tasks', 'Search tasks. Use for "what is overdue", "tasks for Priya", "open tasks in project X".',
+    { status: { type: 'string', enum: ['todo', 'inProgress', 'done', 'open'], description: 'open = not done.' }, assignee: { type: 'string' }, projectName: { type: 'string' },
+      overdue: { type: 'boolean' }, search: { type: 'string' }, limit: { type: 'number' }, countOnly: { type: 'boolean' } }),
+  fn('get_project_details', 'One project: status, linked customer, task progress, overdue and open tasks.', { projectName: { type: 'string' } }, ['projectName']),
+  fn('find_invoices', 'Search invoices by status or client; returns totals too.', { status: { type: 'string', enum: ['draft', 'sent', 'paid', 'overdue'] }, clientName: { type: 'string' }, limit: { type: 'number' } }),
+  fn('list_products', 'The products/services the company sells (name, price, status, features).', { search: { type: 'string' } }),
   fn('voice_setup_status', 'Check how far Astric Voice (AI calling) is set up: phone provider, company info, products, minutes, scheduled campaigns - and what to do next.'),
 ];
 
@@ -228,6 +280,17 @@ const WRITE_TOOLS = [
       isAllDay: { type: 'boolean' }, invitedEmployeeNames: { type: 'array', items: { type: 'string' } } }, ['title', 'startTime', 'endTime']),
   fn('create_invoice', 'Create a draft invoice.', { clientName: { type: 'string' }, clientEmail: { type: 'string' }, companyName: { type: 'string' }, dueDate: { type: 'string' },
     items: { type: 'array', items: { type: 'object', properties: { description: { type: 'string' }, quantity: { type: 'number' }, unitPrice: { type: 'number' } }, required: ['description', 'quantity', 'unitPrice'] } }, notes: { type: 'string' } }, ['clientName', 'items']),
+  fn('add_note', 'Save a note. Optionally attach it to a lead, customer or project (it then also shows in that lead/customer\'s history).',
+    { content: { type: 'string' }, title: { type: 'string' }, attachTo: { type: 'string', enum: ['lead', 'customer', 'project', 'none'] }, attachName: { type: 'string', description: 'Name of the lead/customer/project.' } }, ['content']),
+  fn('update_lead', 'Change ONE specific lead: status, priority, estimated value, phone, email or company. (For many leads at once use update_leads.)',
+    { leadName: { type: 'string' }, phone: { type: 'string' }, leadId: { type: 'string' }, setStage: { type: 'string', enum: STAGES }, setPriority: { type: 'string', enum: PRIORITIES },
+      setEstimatedValue: { type: 'number' }, setPhone: { type: 'string' }, setEmail: { type: 'string' }, setCompany: { type: 'string' } }),
+  fn('schedule_lead_call', 'Schedule an OUTBOUND CALL to ONE lead. callType "ai" = the Astric Voice AI phones them at that time (needs a voice product); "reminder" = a calendar reminder for a human to call.',
+    { leadName: { type: 'string' }, phone: { type: 'string' }, leadId: { type: 'string' }, callType: { type: 'string', enum: ['ai', 'reminder'] },
+      startTime: { type: 'string', description: dateHelp }, productName: { type: 'string', description: 'Voice product (AI calls only).' }, note: { type: 'string', description: 'What the call is about.' },
+      moveFromBatch: { type: 'boolean', description: 'Only if the lead is already in another batch and the user agreed to move them.' } }, ['startTime']),
+  fn('update_task', 'Change ONE existing task: status, deadline or priority.', { taskTitle: { type: 'string' }, setStatus: { type: 'string', enum: ['todo', 'inProgress', 'done'] },
+    setDeadline: { type: 'string' }, setPriority: { type: 'string', enum: ['low', 'medium', 'high'] } }, ['taskTitle']),
   fn('create_voice_product', 'Create a product/service for Astric Voice (AI calling) with the pitch the AI caller will use.',
     { name: { type: 'string' }, description: { type: 'string' }, price: { type: 'string', description: 'Price or offer as text, e.g. "Rs 4,999 / month".' }, goal: { type: 'string', description: 'What the call should achieve, e.g. "book a demo".' },
       pitch: { type: 'string' }, features: { type: 'array', items: { type: 'string' } },
@@ -294,6 +357,70 @@ async function runReadTool(name, args, ctx) {
       if (kind === 'batches') return { batches: (await batches(ctx)).slice(0, 80).map((b) => ({ name: b.name, mode: b.mode || 'manual', voiceStatus: (b.voice && b.voice.status) || '' })) };
       if (kind === 'voice_products') return { products: (await voiceProducts(ctx)).slice(0, 50).map((p) => ({ name: p.name, active: p.active !== false, price: p.price || '', goal: p.goal || '' })) };
       throw new Error('kind is required.');
+    }
+    case 'get_lead_details': {
+      const l = await findLead(ctx, args);
+      const b = await nameOfBatch(ctx, l.batchId);
+      return {
+        id: l.id, name: l.name, phone: l.phone || '', email: l.email || '', company: l.company || '', status: l.stage, priority: l.priority, source: l.source,
+        sourceDetail: l.sourceCustom || '', product: l.productName || '', batch: b, estimatedValue: l.estimatedValue == null ? null : l.estimatedValue,
+        assignedTo: l.assignedTo || l.ownerName || 'Unassigned', created: day(l.createdAt), notes: clip(l.notes, 800),
+        customFields: l.customFields || {}, categories: l.categories || [],
+        followUps: (Array.isArray(l.followUps) ? l.followUps : []).slice(0, 5).map((f) => ({ note: clip(f.note || f.title, 160), due: day(f.dueDate || f.date || f.dueAt), done: !!(f.isDone || f.done || f.completed) })),
+        recentActivity: recentActivities(l.activities),
+      };
+    }
+    case 'get_customer_details': {
+      const c = await findCustomer(ctx, args);
+      const base = orgRef(ctx);
+      const [projects, invoices] = await Promise.all([
+        loadAll(base.collection('projects'), 300).then((all) => all.filter((p) => p.linkedCustomerId === c.id).map((p) => ({ name: p.name, status: p.status || '' }))),
+        c.email ? loadAll(base.collection('invoices').where('clientEmail', '==', c.email), 50).then((all) => all.map((i) => ({ number: i.invoiceNumber, status: i.status, due: day(i.dueDate), total: (i.items || []).reduce((t, it) => t + (+it.quantity || 0) * (+it.unitPrice || 0), 0) }))) : [],
+      ]);
+      return { id: c.id, name: c.name, phone: c.phone || '', email: c.email || '', company: c.company || '', notes: clip(c.notes, 800), customFields: c.customFields || {}, since: day(c.createdAt), projects, invoices, recentActivity: recentActivities(c.activities) };
+    }
+    case 'find_tasks': {
+      const all = await loadAll(orgRef(ctx).collection('tasks'), 1500);
+      let projectId = '';
+      if (args.projectName) { const pr = pickByName(await loadAll(orgRef(ctx).collection('projects'), 300), args.projectName, 'project'); if (!pr) throw new Error(`No project named "${args.projectName}".`); projectId = pr.id; }
+      const who = norm(args.assignee), q = norm(args.search);
+      const rows = all.filter((t) => {
+        if (ctx.isEmployee && t.assigneeId !== ctx.uid) return false;          // employees see only their own tasks
+        if (args.status === 'open' ? t.status === 'done' : args.status && t.status !== args.status) return false;
+        if (who && !norm(t.assignedTo).includes(who)) return false;
+        if (projectId && t.projectId !== projectId) return false;
+        if (q && !(norm(t.title).includes(q) || norm(t.description).includes(q))) return false;
+        if (args.overdue && !(toDate(t.deadline) && toDate(t.deadline) < new Date() && t.status !== 'done')) return false;
+        return true;
+      }).sort((a, b) => (toDate(a.deadline) || 0) - (toDate(b.deadline) || 0));
+      const limit = Math.max(1, Math.min(Number(args.limit) || 15, 30));
+      return { total: rows.length, ...(args.countOnly ? {} : { tasks: rows.slice(0, limit).map(taskBrief) }) };
+    }
+    case 'get_project_details': {
+      const pr = pickByName(await loadAll(orgRef(ctx).collection('projects'), 300), requireString(args, 'projectName'), 'project');
+      if (!pr) throw new Error(`No project named "${args.projectName}".`);
+      const tasks = (await loadAll(orgRef(ctx).collection('tasks'), 1500)).filter((t) => t.projectId === pr.id);
+      const by = (st) => tasks.filter((t) => t.status === st).length;
+      const cust = pr.linkedCustomerId ? (await orgRef(ctx).collection('customers').doc(pr.linkedCustomerId).get()) : null;
+      const open = tasks.filter((t) => t.status !== 'done').sort((a, b) => (toDate(a.deadline) || 0) - (toDate(b.deadline) || 0));
+      return { id: pr.id, name: pr.name, description: clip(pr.description, 500), status: pr.status || '', customer: cust && cust.exists ? cust.data().name : '', created: day(pr.createdAt),
+        tasks: { total: tasks.length, todo: by('todo'), inProgress: by('inProgress'), done: by('done'), overdue: open.filter((t) => taskBrief(t).overdue).length,
+          percentDone: tasks.length ? Math.round((by('done') / tasks.length) * 100) : 0 }, openTasks: open.slice(0, 10).map(taskBrief) };
+    }
+    case 'find_invoices': {
+      const all = await loadAll(orgRef(ctx).collection('invoices'), 1000);
+      const q = norm(args.clientName);
+      const total = (i) => (i.items || []).reduce((t, it) => t + (+it.quantity || 0) * (+it.unitPrice || 0), 0);
+      const isOverdue = (i) => i.status !== 'paid' && toDate(i.dueDate) && toDate(i.dueDate) < new Date();
+      const rows = all.filter((i) => (!q || norm(i.clientName).includes(q)) && (!args.status || (args.status === 'overdue' ? isOverdue(i) : i.status === args.status)));
+      const limit = Math.max(1, Math.min(Number(args.limit) || 10, 25));
+      return { count: rows.length, totalAmount: Math.round(rows.reduce((t, i) => t + total(i), 0) * 100) / 100,
+        invoices: rows.slice(0, limit).map((i) => ({ number: i.invoiceNumber, client: i.clientName, status: isOverdue(i) && i.status !== 'draft' ? 'overdue' : i.status, due: day(i.dueDate), total: total(i) })) };
+    }
+    case 'list_products': {
+      const q = norm(args.search);
+      const all = (await loadAll(orgRef(ctx).collection('products'), 200)).filter((p) => p.active !== false && (!q || norm(p.name).includes(q)));
+      return { count: all.length, products: all.slice(0, 40).map((p) => ({ name: p.name, tagline: p.tagline || '', price: p.rate == null ? 'not priced' : `${p.rate}${p.rateUnit ? ` (${p.rateUnit})` : ''}`, status: p.status || '', features: (p.features || []).slice(0, 6), description: clip(p.description, 200) })) };
     }
     case 'voice_setup_status': return voiceSetupStatus(ctx);
     default: throw new Error(`Unknown tool: ${name}`);
@@ -471,6 +598,71 @@ async function validateAction(type, params, ctx) {
       return { normalized: { batchName: b ? b.name : batchName, productName: p ? p.name : productName, startTime, provider },
         summary: `Start AI calling for the batch "${b ? b.name : batchName}" with "${p ? p.name : productName}" ${when}${provider !== 'auto' ? ` using ${provider}` : ''}.` };
     }
+    case 'add_note': {
+      const content = requireString(params, 'content', { max: 4000 });
+      const kind = requireEnum(params, 'attachTo', ['lead', 'customer', 'project', 'none'], 'none');
+      const title = optString(params, 'title', { max: 120 }) || clip(content, 40).replace(/\s+/g, ' ');
+      let target = null;
+      if (kind !== 'none') {
+        const name = requireString(params, 'attachName', { max: 120 });
+        if (kind === 'lead') { const l = await findLead(ctx, { leadName: name, leadId: params.attachId }); target = { id: l.id, label: l.name }; }
+        else if (kind === 'customer') { const c = await findCustomer(ctx, { customerName: name }); target = { id: c.id, label: c.name }; }
+        else { const pr = pickByName(await loadAll(orgRef(ctx).collection('projects'), 300), name, 'project'); if (!pr) throw new Error(`No project named "${name}".`); target = { id: pr.id, label: pr.name }; }
+      } else if (ctx.isEmployee) {
+        throw new Error('Standalone notes are not available to team members in Agent Mode yet. Attach it to a lead or customer instead.');
+      }
+      const n = { title, content, attachTo: kind, attachName: target ? target.label : '', attachId: target ? target.id : '' };
+      return { normalized: n, echo: n, summary: `Save the note "${title}"${target ? ` on the ${kind} ${target.label}` : ''}.` };
+    }
+    case 'update_lead': {
+      const l = await findLead(ctx, params);
+      const upd = {};
+      const st = requireEnum(params, 'setStage', STAGES, ''); if (st) upd.stage = st;
+      const pr = requireEnum(params, 'setPriority', PRIORITIES, ''); if (pr) upd.priority = pr;
+      if (params.setEstimatedValue != null && params.setEstimatedValue !== '') upd.estimatedValue = requireNumber(params, 'setEstimatedValue', { min: 0, max: 1e10 });
+      if (params.setPhone) upd.phone = optString(params, 'setPhone', { max: 40 });
+      if (params.setEmail) upd.email = optString(params, 'setEmail', { max: 200 });
+      if (params.setCompany) upd.company = optString(params, 'setCompany', { max: 200 });
+      if (!Object.keys(upd).length) throw new Error('Nothing to change: tell me the new status, priority, value, phone, email or company.');
+      if (upd.phone && digits(upd.phone) !== digits(l.phone)) throw new Error('Changing a phone number is not supported here because it must stay unique across your leads. Change it in the lead screen.');
+      const label = Object.entries(upd).map(([k, v]) => `${k === 'stage' ? 'status' : k === 'estimatedValue' ? 'value' : k} → ${v}`).join(', ');
+      const n = { leadId: l.id, leadName: l.name, ...Object.fromEntries(Object.entries(upd).map(([k, v]) => [`set${k[0].toUpperCase()}${k.slice(1)}`, v])) };
+      return { normalized: n, echo: n, summary: `Update the lead ${l.name}: ${label}.` };
+    }
+    case 'schedule_lead_call': {
+      const l = await findLead(ctx, params);
+      const callType = requireEnum(params, 'callType', ['ai', 'reminder'], 'ai');
+      if (!params.startTime) throw new Error('When should the call happen? Give a date and time.');
+      const d = parseInTz(params.startTime);
+      if (d.getTime() < Date.now() - 60e3) throw new Error('That time is in the past.');
+      if (d.getTime() > Date.now() + 60 * 86400e3) throw new Error('Calls can be scheduled up to 60 days ahead.');
+      const when = d.toLocaleString('en-IN', { timeZone: DEFAULT_TZ, dateStyle: 'medium', timeStyle: 'short' });
+      const note = optString(params, 'note', { max: 500 });
+      if (callType === 'reminder') {
+        const n = { leadId: l.id, leadName: l.name, callType, startTime: d.toISOString(), note };
+        return { normalized: n, echo: n, summary: `Add a calendar reminder to call ${l.name}${l.phone ? ` (${l.phone})` : ''} on ${when} IST.` };
+      }
+      if (!digits(l.phone)) throw new Error(`${l.name} has no phone number, so an AI call can't be placed. Add a number first, or use a reminder for a human call.`);
+      const productName = requireString(params, 'productName', { max: 120 });
+      const p = pickByName(await voiceProducts(ctx), productName, 'voice product');
+      if (!p && !plan(ctx).voiceProducts.has(norm(productName))) throw new Error(`No Astric Voice product named "${productName}". I can create it: tell me the price and what the call should achieve.`);
+      const cur = l.batchId ? await nameOfBatch(ctx, l.batchId) : '';
+      if (l.batchId && !params.moveFromBatch) throw new Error(`${l.name} is already in the batch "${cur || 'another batch'}". I can schedule that whole batch instead, or move ${l.name} into a call of their own (say "move them").`);
+      const n = { leadId: l.id, leadName: l.name, callType, startTime: d.toISOString(), productName: p ? p.name : productName, note, moveFromBatch: !!params.moveFromBatch };
+      return { normalized: n, echo: n, summary: `Schedule an AI call to ${l.name} (${l.phone}) on ${when} IST with "${n.productName}"${l.batchId ? `, moving them out of "${cur}"` : ''}.` };
+    }
+    case 'update_task': {
+      const t = pickByName(await loadAll(orgRef(ctx).collection('tasks'), 1500), requireString(params, 'taskTitle', { max: 200 }), 'task', 'title');
+      if (!t) throw new Error(`No task called "${params.taskTitle}".`);
+      if (ctx.isEmployee && t.assigneeId !== ctx.uid) throw new Error('You can only change tasks assigned to you.');
+      const st = requireEnum(params, 'setStatus', ['todo', 'inProgress', 'done'], '');
+      const pr = requireEnum(params, 'setPriority', ['low', 'medium', 'high'], '');
+      const dl = params.setDeadline ? requireDate(params, 'setDeadline') : null;
+      if (!st && !pr && !dl) throw new Error('Nothing to change: give a new status, deadline or priority.');
+      const n = { taskId: t.id, taskTitle: t.title, ...(st ? { setStatus: st } : {}), ...(pr ? { setPriority: pr } : {}), ...(dl ? { setDeadline: dl.toISOString() } : {}) };
+      return { normalized: { ...n, ...(dl ? { setDeadline: dl } : {}) }, echo: n,
+        summary: `Update the task "${t.title}": ${[st && `status → ${st}`, pr && `priority → ${pr}`, dl && `due ${dl.toDateString()}`].filter(Boolean).join(', ')}.` };
+    }
     default: throw new Error(`Unknown action type: ${type}`);
   }
 }
@@ -602,6 +794,75 @@ async function executeAction(type, params, ctx) {
       await ref.set({ invoiceNumber, clientName: n.clientName, clientEmail: n.clientEmail, companyName: n.companyName, items: n.items, customFields: [], status: 'draft',
         createdAt: now, dueDate: admin.firestore.Timestamp.fromDate(n.dueDate), notes: n.notes, createdByAgent: true, createdByUid: uid });
       return { id: ref.id, entity: 'invoice', invoiceNumber };
+    }
+    case 'add_note': {
+      const nowIso = new Date().toISOString();
+      const logLine = { id: crypto.randomUUID(), note: n.content, type: 'note', createdBy: 'Agent Mode', createdAt: admin.firestore.Timestamp.now() };
+      let noteId = '';
+      if (!ctx.isEmployee) {            // the Notes screen reads users/{owner}/notes
+        const ref = base.collection('notes').doc();
+        await ref.set({ title: n.title, content: n.content, color: 'gold', tag: n.attachTo === 'none' ? 'none' : n.attachTo, tagId: n.attachId || null, tagLabel: n.attachName || null, isPinned: false, createdAt: nowIso, updatedAt: nowIso, createdByAgent: true });
+        noteId = ref.id;
+      }
+      if (n.attachTo === 'lead') await base.collection('leads').doc(n.attachId).update({ activities: admin.firestore.FieldValue.arrayUnion(logLine) });
+      else if (n.attachTo === 'customer') await base.collection('customers').doc(n.attachId).update({ activities: admin.firestore.FieldValue.arrayUnion(logLine) });
+      return { id: noteId || n.attachId, entity: 'note', message: n.attachTo === 'none' ? 'Note saved.' : `Note saved on ${n.attachName}.` };
+    }
+    case 'update_lead': {
+      const ref = base.collection('leads').doc(n.leadId);
+      const cur = await ref.get();
+      if (!cur.exists || !canSee(ctx, cur.data())) throw new Error('That lead no longer exists.');
+      const upd = {};
+      if (n.setStage) upd.stage = n.setStage; if (n.setPriority) upd.priority = n.setPriority;
+      if (n.setEstimatedValue != null) upd.estimatedValue = n.setEstimatedValue;
+      if (n.setPhone) upd.phone = n.setPhone; if (n.setEmail) upd.email = n.setEmail; if (n.setCompany) upd.company = n.setCompany;
+      const note = { id: crypto.randomUUID(), note: `Changed by Agent Mode: ${Object.entries(upd).map(([k, v]) => `${k === 'stage' ? 'status' : k} → ${v}`).join(', ')}`, type: n.setStage ? 'stage_change' : 'note', createdBy: 'Agent Mode', createdAt: admin.firestore.Timestamp.now() };
+      await ref.update({ ...upd, activities: admin.firestore.FieldValue.arrayUnion(note) });
+      return { id: n.leadId, entity: 'lead', message: `${n.leadName} updated.` };
+    }
+    case 'schedule_lead_call': {
+      const lref = base.collection('leads').doc(n.leadId);
+      const ls = await lref.get();
+      if (!ls.exists || !canSee(ctx, ls.data())) throw new Error('That lead no longer exists.');
+      const lead = { id: ls.id, ...ls.data() };
+      if (n.callType === 'reminder') {
+        const start = toWall(n.startTime), endD = new Date(parseInTz(n.startTime).getTime() + 15 * 60e3);
+        const ref = base.collection('calendar_events').doc();
+        const stamp = new Date().toISOString();
+        await ref.set({ title: `Call ${lead.name}`, description: n.note || `Call ${lead.name}${lead.phone ? ` on ${lead.phone}` : ''}`, location: '', startTime: start, endTime: toWall(endD.toISOString()), isAllDay: false,
+          color: 'teal', repeat: 'none', reminderMinutes: 15, invitedEmployeeIds: [], linkedTo: 'lead', linkedId: lead.id, linkedLabel: lead.name,
+          attachments: [], createdAt: stamp, updatedAt: stamp, source: 'agent', createdByUid: uid });
+        return { id: ref.id, entity: 'calendar_event', message: `Reminder set to call ${lead.name}.` };
+      }
+      const p = pickByName(await voiceProducts(ctx), n.productName, 'voice product');
+      if (!p) throw new Error(`No voice product named "${n.productName}" found.`);
+      if (lead.batchId && !n.moveFromBatch) throw new Error(`${lead.name} is already in a batch.`);
+      // The dialler works on batches, so a single call is a batch of one. Named clearly so it is easy to spot and delete.
+      const label = parseInTz(n.startTime).toLocaleString('en-IN', { timeZone: DEFAULT_TZ, dateStyle: 'medium', timeStyle: 'short' });
+      let batchName = `Call: ${lead.name} (${label})`.slice(0, 80);
+      if ((await batches(ctx)).some((b) => norm(b.name) === norm(batchName))) batchName = `${batchName.slice(0, 70)} #${Date.now().toString().slice(-4)}`;
+      const batchId = await ing().createBatch(ctx.orgOwnerUid, batchName, uid);
+      await base.collection('lead_batches').doc(batchId).update({ mode: 'ai' });
+      await lref.update({ batchId, activities: admin.firestore.FieldValue.arrayUnion({ id: crypto.randomUUID(), note: `AI call scheduled for ${label} IST${n.note ? ` — ${n.note}` : ''}`, type: 'note', createdBy: 'Agent Mode', createdAt: admin.firestore.Timestamp.now() }) });
+      try {
+        const res = await callVoiceApi(ctx, 'POST', `/batches/${batchId}/schedule`, { productId: p.id, scheduledAt: n.startTime });
+        return { id: batchId, entity: 'voice_campaign', message: `AI call to ${lead.name} scheduled for ${label} IST — see Astric Voice → Schedules.`, result: res };
+      } catch (e) {
+        // Don't leave a half-made batch behind if the voice service refused (no minutes, no carrier, ...).
+        await lref.update({ batchId: lead.batchId || '' }).catch(() => {});
+        await ing().deleteBatch(ctx.orgOwnerUid, batchId).catch(() => {});
+        throw e;
+      }
+    }
+    case 'update_task': {
+      const ref = base.collection('tasks').doc(n.taskId);
+      const cur = await ref.get();
+      if (!cur.exists) throw new Error('That task no longer exists.');
+      const upd = {};
+      if (n.setStatus) upd.status = n.setStatus; if (n.setPriority) upd.priority = n.setPriority;
+      if (n.setDeadline) upd.deadline = admin.firestore.Timestamp.fromDate(new Date(n.setDeadline));
+      await ref.update(upd);
+      return { id: n.taskId, entity: 'task', message: `Task "${n.taskTitle}" updated.` };
     }
     case 'create_voice_product': {
       const ref = base.collection('voice_products').doc();

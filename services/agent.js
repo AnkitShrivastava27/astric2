@@ -61,12 +61,14 @@ async function resolveOrgContext(uid) {
   if (!userSnap.exists) return null;
   const userData = userSnap.data();
 
-  const orgOwnerUid = (userData.isEmployee && userData.adminId) ? userData.adminId : uid;
+  // Employees are marked role:'employee' (older ones isEmployee:true): both must resolve to the admin's workspace.
+  const isEmployee = !!(userData.isEmployee || userData.role === 'employee');
+  const orgOwnerUid = (isEmployee && userData.adminId) ? userData.adminId : uid;
   const orgSnap = orgOwnerUid === uid ? userSnap : await db.collection('users').doc(orgOwnerUid).get();
   if (!orgSnap.exists) return null;
 
   const plan = orgSnap.data().subscription?.plan || 'basic';
-  return { uid, orgOwnerUid, plan, isEmployee: !!userData.isEmployee };
+  return { uid, orgOwnerUid, plan, isEmployee: isEmployee && orgOwnerUid !== uid };
 }
 
 module.exports = {

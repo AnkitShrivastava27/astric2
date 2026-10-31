@@ -30,12 +30,15 @@ function systemPrompt() {
 Now: ${ist} (India time). Dates the user gives are India time unless they say otherwise.
 
 LOOK THINGS UP (runs immediately, changes nothing): web_search for current information (news, prices, rates, weather, anything that may have changed),
-get_calendar for meetings, find_leads, business_snapshot, list_items, voice_setup_status. Use these first whenever the answer depends on the user's data
+get_calendar for meetings, find_leads, get_lead_details (everything about one lead), get_customer_details, find_tasks, get_project_details,
+find_invoices, list_products, business_snapshot, list_items, voice_setup_status. Use these first whenever the answer depends on the user's data
 or on current facts. Never guess numbers, names or meetings: look them up. After looking up, answer in plain, short text.
 
 DO THINGS (the user sees a summary and must confirm before anything is written): create_lead, bulk_create_leads, create_lead_batch, update_leads,
 create_customer, create_task / assign_task (one or many employees, or a whole team: each person gets their own copy), create_project,
-create_calendar_event, create_invoice, create_voice_product, schedule_voice_calls.
+create_calendar_event, create_invoice, create_voice_product, schedule_voice_calls,
+add_note (a note, optionally on a lead / customer / project), update_lead (ONE lead), update_task (ONE task), schedule_lead_call (an outbound call to ONE lead:
+"ai" = Astric Voice phones them, "reminder" = calendar reminder for a human).
 - Several actions in one request are fine: call each tool once, in the right order (e.g. create_voice_product, then create_lead_batch, then schedule_voice_calls).
   Refer to batches, products, employees and teams by NAME. A batch or product created earlier in the same request can be used by name in a later step.
 - "a batch of people with status X" = create_lead_batch with stage X. Status values: new_, contacted, qualified, proposal, won, lost.
@@ -43,6 +46,9 @@ create_calendar_event, create_invoice, create_voice_product, schedule_voice_call
   Do not invent phone numbers, prices or facts.
 - To set up Astric Voice calls: call voice_setup_status, then do what you can (create_voice_product, create_lead_batch, schedule_voice_calls) and tell the user
   clearly about anything only they can do (adding Vobiz/Telnyx keys, buying minutes).
+- For a question about one specific person or record ("details of Ravi", "what's X's number") call get_lead_details / get_customer_details and answer from the result.
+  If several match, list them and ask which one. Never invent details that were not returned.
+- To call ONE lead at a set time, use schedule_lead_call (it needs a time; for "ai" also a voice product). If the lead is already in a batch, tell the user and ask before moving them.
 - After your tool calls the app shows the confirmation; do not write a long message about what you are about to do.
 Times for calendar events and calls: ISO like 2026-10-27T10:00:00 (India time) unless another zone is given.
 Write replies in Markdown (the app renders it): short "## " headings only for longer answers, "- " bullets for lists, **bold** for key names and figures, a table when comparing items. Never write a heading as a bold line.
@@ -112,7 +118,7 @@ router.post('/ai/agent', requireAuth, rateLimit({ windowMs: 60_000, max: 20, key
 
       if (!calls.length) {                                    // a plain answer
         await finish();
-        return res.status(200).json({ needsConfirmation: false, reply: (msg.content || '').trim(), ...(sources().length ? { sources: sources() } : {}) });
+        return res.status(200).json({ needsConfirmation: false, reply: (msg.content || '').trim() || 'I could not put together an answer to that. Could you rephrase or give me a little more detail?', ...(sources().length ? { sources: sources() } : {}) });
       }
 
       messages.push({ role: 'assistant', content: msg.content || null, tool_calls: calls });
@@ -139,6 +145,10 @@ router.post('/ai/agent', requireAuth, rateLimit({ windowMs: 60_000, max: 20, key
         }
       }
 
+      if (proposals.length > 8) {
+        await finish();
+        return res.status(200).json({ needsConfirmation: false, reply: `That is ${proposals.length} separate actions and I can do at most 8 at a time. Let's do the first 8 now; tell me which ones matter most, or split the request.` });
+      }
       if (proposals.length) {
         await finish();
         const one = proposals.length === 1;
@@ -157,9 +167,13 @@ router.post('/ai/agent', requireAuth, rateLimit({ windowMs: 60_000, max: 20, key
 
   } catch (err) {
     if (reservation) await settleTokens({ ...billing, reservation, actual: 0 });
-    const msg = err?.response?.data?.error?.message || err.message || 'Agent request failed.';
     console.error('/ai/agent error:', err?.response?.data || err.message);
-    return res.status(500).json({ error: msg });
+    const up = err?.response?.status;
+    if (err.code === 'ECONNABORTED' || /timeout/i.test(err.message || '')) return res.status(504).json({ error: 'The assistant took too long to answer. Please try again, or ask for something smaller.' });
+    if (up === 429) return res.status(503).json({ error: 'The assistant is busy right now. Wait a few seconds and try again.' });
+    if (up === 401 || up === 403) return res.status(503).json({ error: 'The assistant is temporarily unavailable. Please try again later.' });
+    if (up >= 500) return res.status(502).json({ error: 'The AI service had a problem. Please try again in a moment.' });
+    return res.status(500).json({ error: 'Something went wrong while I was working on that. Please try again.' });
   }
 });
 
@@ -170,8 +184,9 @@ router.post('/ai/agent', requireAuth, rateLimit({ windowMs: 60_000, max: 20, key
 // though it just came from our own /ai/agent response.
 // =============================================================================
 router.post('/ai/agent/execute', requireAuth, rateLimit({ windowMs: 60_000, max: 20, keyFn: r => `agent-exec:${r.uid}` }), async (req, res) => {
+  let claim = null;
   try {
-    const { type, params } = req.body;
+    const { type, params, requestId } = req.body;
     if (!type || !params) return res.status(400).json({ error: 'type and params are required.' });
 
     const ctx = await resolveOrgContext(req.uid);
@@ -180,12 +195,30 @@ router.post('/ai/agent/execute', requireAuth, rateLimit({ windowMs: 60_000, max:
       return res.status(403).json({ error: 'Agent Mode is a Premium feature.', requiresUpgrade: true });
     }
 
+    // Double-tap / retry protection: the same requestId can only run once. A second call gets the first result back.
+    if (typeof requestId === 'string' && /^[A-Za-z0-9_-]{8,64}$/.test(requestId)) {
+      claim = db.collection('users').doc(ctx.orgOwnerUid).collection('agent_runs').doc(`${req.uid}_${requestId}`);
+      try { await claim.create({ status: 'running', type, at: admin.firestore.Timestamp.now() }); }
+      catch (e) {
+        if (e.code === 6 || e.code === 'already-exists') {
+          const prev = await claim.get();
+          const d = prev.exists ? prev.data() : {};
+          claim = null;                                          // not ours: never delete it
+          if (d.status === 'done') return res.status(200).json({ success: true, alreadyDone: true, ...(d.result || {}) });
+          return res.status(409).json({ error: 'That action is already being carried out. Give it a few seconds.' });
+        }
+        claim = null;                                             // dedupe store hiccup: carry on rather than block the user
+      }
+    }
+
     const cx = { ...ctx, authHeader: req.headers.authorization || '' };
     const result = type === 'plan' ? await executePlan(params.steps, cx) : await executeAction(type, params, cx);
     console.log(`[agent/execute] uid=${req.uid} org=${ctx.orgOwnerUid} type=${type} -> ${result.entity}:${result.id || result.count}`);
+    if (claim) await claim.set({ status: 'done', result: JSON.parse(JSON.stringify(result, (k, v) => (k === 'result' ? undefined : v))) }, { merge: true }).catch(() => {});
     return res.status(200).json({ success: true, ...result });
 
   } catch (err) {
+    if (claim && !err.done) await claim.delete().catch(() => {});      // a clean failure can be retried; a half-done plan cannot
     console.error('/ai/agent/execute error:', err.message);
     return res.status(400).json({ error: err.message || 'Could not complete that action.', ...(err.done ? { done: err.done } : {}) });
   }

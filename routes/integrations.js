@@ -8,6 +8,8 @@ const {
   connectedChannelRef, exchangeHubspotCode, exchangeSalesforceCode,
   exchangeQuickBooksCode, getValidAccessToken,
 } = require('../services/integrations');
+const { encryptFields, decryptFields } = require('../services/secretBox');
+const { SECRET_FIELDS } = require('../services/integrations');
 const { SERVER_BASE_URL, APP_DEEPLINK_SCHEME, HUBSPOT_CLIENT_ID, HUBSPOT_SCOPES } = require('../config/env');
 
 const VALID_PROVIDERS = new Set(['hubspot', 'salesforce', 'quickbooks']);
@@ -46,12 +48,12 @@ router.get('/integrations/hubspot/callback', async (req, res) => {
   try {
     const redirectUri = `${SERVER_BASE_URL}/integrations/hubspot/callback`;
     const tokens = await exchangeHubspotCode(code, redirectUri);
-    await connectedChannelRef(payload.uid, 'hubspot').set({
+    await connectedChannelRef(payload.uid, 'hubspot').set(encryptFields({
       accessToken: tokens.access_token,
       refreshToken: tokens.refresh_token,
       expiresAt: Date.now() + (tokens.expires_in || 1800) * 1000,
       connectedAt: Date.now(),
-    }, { merge: true });
+    }, SECRET_FIELDS), { merge: true });
     console.log(`[integrations/hubspot] connected for uid=${payload.uid}`);
     return res.redirect(deeplinkResult('hubspot', 'success'));
   } catch (err) {
@@ -71,9 +73,11 @@ router.post('/integrations/salesforce/credentials', requireAuth, async (req, res
   const { clientId, clientSecret, environment } = req.body;
   if (!clientId || !clientSecret) return res.status(400).json({ error: 'clientId and clientSecret are required.' });
 
-  await connectedChannelRef(req.uid, 'salesforce').set({
-    clientId, clientSecret, environment: environment === 'sandbox' ? 'sandbox' : 'production',
-  }, { merge: true });
+  try {
+    await connectedChannelRef(req.uid, 'salesforce').set(encryptFields({
+      clientId, clientSecret, environment: environment === 'sandbox' ? 'sandbox' : 'production',
+    }, SECRET_FIELDS), { merge: true });
+  } catch (e) { console.error('[integrations/salesforce/credentials]', e.message); return res.status(500).json({ error: 'Could not store your credentials safely right now.' }); }
   return res.status(200).json({ success: true });
 });
 
@@ -105,18 +109,18 @@ router.get('/integrations/salesforce/callback', async (req, res) => {
     const ref = connectedChannelRef(payload.uid, 'salesforce');
     const snap = await ref.get();
     if (!snap.exists) return res.redirect(deeplinkResult('salesforce', 'error', 'Credentials not found.'));
-    const { clientId, clientSecret, environment } = snap.data();
+    const { clientId, clientSecret, environment } = decryptFields(snap.data(), SECRET_FIELDS);
 
     const redirectUri = `${SERVER_BASE_URL}/integrations/salesforce/callback`;
     const tokens = await exchangeSalesforceCode({ code, clientId, clientSecret, redirectUri, environment });
 
-    await ref.set({
+    await ref.set(encryptFields({
       accessToken: tokens.access_token,
       refreshToken: tokens.refresh_token,
       instanceUrl: tokens.instance_url,
       expiresAt: Date.now() + 2 * 60 * 60 * 1000, // Salesforce tokens don't return expires_in; assume 2hr, refreshed on demand anyway
       connectedAt: Date.now(),
-    }, { merge: true });
+    }, SECRET_FIELDS), { merge: true });
 
     console.log(`[integrations/salesforce] connected for uid=${payload.uid}`);
     return res.redirect(deeplinkResult('salesforce', 'success'));
@@ -136,9 +140,11 @@ router.post('/integrations/quickbooks/credentials', requireAuth, async (req, res
   const { clientId, clientSecret, environment } = req.body;
   if (!clientId || !clientSecret) return res.status(400).json({ error: 'clientId and clientSecret are required.' });
 
-  await connectedChannelRef(req.uid, 'quickbooks').set({
-    clientId, clientSecret, environment: environment === 'sandbox' ? 'sandbox' : 'production',
-  }, { merge: true });
+  try {
+    await connectedChannelRef(req.uid, 'quickbooks').set(encryptFields({
+      clientId, clientSecret, environment: environment === 'sandbox' ? 'sandbox' : 'production',
+    }, SECRET_FIELDS), { merge: true });
+  } catch (e) { console.error('[integrations/quickbooks/credentials]', e.message); return res.status(500).json({ error: 'Could not store your credentials safely right now.' }); }
   return res.status(200).json({ success: true });
 });
 
@@ -170,18 +176,18 @@ router.get('/integrations/quickbooks/callback', async (req, res) => {
     const ref = connectedChannelRef(payload.uid, 'quickbooks');
     const snap = await ref.get();
     if (!snap.exists) return res.redirect(deeplinkResult('quickbooks', 'error', 'Credentials not found.'));
-    const { clientId, clientSecret } = snap.data();
+    const { clientId, clientSecret } = decryptFields(snap.data(), SECRET_FIELDS);
 
     const redirectUri = `${SERVER_BASE_URL}/integrations/quickbooks/callback`;
     const tokens = await exchangeQuickBooksCode({ code, clientId, clientSecret, redirectUri });
 
-    await ref.set({
+    await ref.set(encryptFields({
       accessToken: tokens.access_token,
       refreshToken: tokens.refresh_token,
       realmId: realmId || null,
       expiresAt: Date.now() + (tokens.expires_in || 3600) * 1000,
       connectedAt: Date.now(),
-    }, { merge: true });
+    }, SECRET_FIELDS), { merge: true });
 
     console.log(`[integrations/quickbooks] connected for uid=${payload.uid}`);
     return res.redirect(deeplinkResult('quickbooks', 'success'));

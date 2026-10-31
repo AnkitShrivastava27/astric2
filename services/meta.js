@@ -1,4 +1,5 @@
 'use strict';
+const { decryptFields } = require('./secretBox');
 
 const axios = require('axios');
 const crypto = require('crypto');
@@ -81,7 +82,11 @@ async function getChannelCreds(uid, channelType) {
   try {
     const snap = await db.collection('users').doc(uid)
       .collection('connectedChannels').doc(channelType).get();
-    return snap.exists ? snap.data().credentials : null;
+    if (!snap.exists) return null;
+    const c = snap.data().credentials;
+    if (!c) return null;
+    // Stored encrypted by POST /secrets/channel; older plaintext values still work until migrated.
+    return decryptFields(c, ['accessToken', 'botToken', 'appSecret', 'pageToken']);
   } catch (_) {
     return null;
   }

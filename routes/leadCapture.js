@@ -36,6 +36,7 @@ const { rateLimit } = require('../middleware/rateLimit');
 const { csvToObjects } = require('../services/csvParse');
 const { mapFields, ingestLead, ingestMany, notifyNewLead, loadProducts, applyProduct, createBatch, deleteBatch } = require('../services/leadIngest');
 const { fetchSheetCsv, SheetError } = require('../services/sheetFetch');
+const { encrypt, decrypt } = require('../services/secretBox');
 
 const GRAPH = `https://graph.facebook.com/${process.env.META_GRAPH_VERSION || 'v19.0'}`;
 const urlencoded = express.urlencoded({ extended: true, limit: '200kb' });
@@ -183,6 +184,56 @@ router.post('/capture/qr', requireAuth, guard(async (req, res) => {
   res.json({ formUrl: url, productName, formQrPng: await QRCode.toDataURL(url, { margin: 1, width: 480, errorCorrectionLevel: 'M' }) });
 }));
 
+// ── Import jobs ──────────────────────────────────────────────────────────────
+// A big file can take minutes to write, longer than a phone (60s) or a proxy (~100s) will wait. So when the app
+// sends { async: true } we answer at once with a jobId, keep importing in the background, and the app polls
+// GET /capture/import/:jobId for progress. Without the flag the old "wait for everything" behaviour is kept.
+const jobRef = (orgId, id) => db.collection('users').doc(orgId).collection('lead_import_jobs').doc(id);
+const STALL_MS = 10 * 60 * 1000;
+
+async function startImportJob({ orgId, uid, records, prep, defaultSource, sourceLabel }) {
+  const ref = db.collection('users').doc(orgId).collection('lead_import_jobs').doc();
+  const base = { uid, total: records.length, processed: 0, created: 0, duplicates: 0, invalid: 0, unmatchedProducts: 0, errors: [], batchName: prep.batchName || '', productName: prep.productName || '' };
+  await ref.set({ ...base, status: 'running', createdAt: admin.firestore.FieldValue.serverTimestamp(), updatedAt: admin.firestore.Timestamp.now() });
+  let lastWrite = 0;
+  setImmediate(async () => {
+    try {
+      const result = await ingestMany(orgId, records, { createdBy: uid, defaultSource, sourceLabel, ...prep.opts }, {
+        onProgress: async (r, done) => {
+          const now = Date.now();
+          if (now - lastWrite < 1500 && done < records.length) return;      // don't hammer Firestore on every chunk
+          lastWrite = now;
+          await ref.update({ processed: done, created: r.created, duplicates: r.duplicates, invalid: r.invalid, unmatchedProducts: r.unmatchedProducts, errors: r.errors, updatedAt: admin.firestore.Timestamp.now() });
+        },
+      });
+      const fin = await finishImport(orgId, prep, result);
+      await ref.update({ ...result, processed: records.length, ...fin, status: 'done', updatedAt: admin.firestore.Timestamp.now() });
+    } catch (e) {
+      console.error('[capture/import job]', e.message);
+      await ref.update({ status: 'failed', error: 'The import stopped unexpectedly. Leads added so far are saved; run it again and duplicates will be skipped.', updatedAt: admin.firestore.Timestamp.now() }).catch(() => {});
+    }
+  });
+  return { jobId: ref.id, total: records.length };
+}
+
+router.get('/capture/import/:jobId', requireAuth, guard(async (req, res) => {
+  const { orgId } = await memberContext(req.uid);
+  if (!/^[A-Za-z0-9]{4,40}$/.test(req.params.jobId)) return res.status(400).json({ error: 'Invalid import id.' });
+  const snap = await jobRef(orgId, req.params.jobId).get();
+  if (!snap.exists) return res.status(404).json({ error: 'That import was not found.' });
+  const j = snap.data();
+  const last = j.updatedAt && j.updatedAt.toDate ? j.updatedAt.toDate().getTime() : Date.now();
+  if (j.status === 'running' && Date.now() - last > STALL_MS) {
+    return res.json({ ...pickJob(j), status: 'failed', error: 'The server restarted during the import. Leads added so far are saved; run the file again and duplicates will be skipped.' });
+  }
+  res.json(pickJob(j));
+}));
+const pickJob = (j) => ({
+  status: j.status, total: j.total || 0, processed: j.processed || 0, created: j.created || 0, duplicates: j.duplicates || 0,
+  invalid: j.invalid || 0, unmatchedProducts: j.unmatchedProducts || 0, errors: j.errors || [], batchName: j.batchName || '',
+  productName: j.productName || '', error: j.error || '',
+});
+
 router.post('/capture/import', requireAuth, rateLimit({ windowMs: 60_000, max: 10, keyFn: (r) => `cap-imp:${r.uid}` }),
   guard(async (req, res) => {
     const { orgId, uid } = await memberContext(req.uid);
@@ -193,6 +244,10 @@ router.post('/capture/import', requireAuth, rateLimit({ windowMs: 60_000, max: 1
     if (!known) return res.status(400).json({ error: 'Row 1 must be a header row with at least a name, email or phone column.' });
     if (!records.length) return res.status(400).json({ error: 'The file has a header row but no leads.' });
     const prep = await prepareImport(orgId, uid, req.body || {});
+    if ((req.body || {}).async === true) {
+      const job = await startImportJob({ orgId, uid, records, prep, defaultSource: 'manualWalkIn', sourceLabel: 'CSV Import' });
+      return res.status(202).json({ ok: true, async: true, ...job });
+    }
     const result = await ingestMany(orgId, records, { createdBy: uid, defaultSource: 'manualWalkIn', sourceLabel: 'CSV Import', ...prep.opts });
     res.json({ ok: true, total: records.length, ...result, ...(await finishImport(orgId, prep, result)) });
   }));
@@ -212,6 +267,10 @@ router.post('/capture/sheets/import', requireAuth, rateLimit({ windowMs: 60_000,
     if (!known) return res.status(400).json({ error: 'Row 1 of the sheet must be headers with a name, email or phone column.' });
     if (!records.length) return res.status(400).json({ error: 'The sheet has headers but no leads yet.' });
     const prep = await prepareImport(orgId, uid, req.body || {});
+    if ((req.body || {}).async === true) {
+      const job = await startImportJob({ orgId, uid, records, prep, defaultSource: 'other', sourceLabel: 'Google Sheets' });
+      return res.status(202).json({ ok: true, async: true, ...job });
+    }
     const result = await ingestMany(orgId, records, { createdBy: uid, defaultSource: 'other', sourceLabel: 'Google Sheets', ...prep.opts });
     res.json({ ok: true, total: records.length, ...result, ...(await finishImport(orgId, prep, result)) });
   }));
@@ -235,7 +294,7 @@ router.post('/capture/facebook', requireAuth, rateLimit({ windowMs: 60_000, max:
       subscribed = true;
     } catch (e) { subscribeError = e.response?.data?.error?.message || e.message; }
 
-    await secretsRef(orgId).update({ fbPageToken: pageToken, fbAppSecret: appSecret, fbPageId: page.id, fbPageName: page.name });
+    await secretsRef(orgId).update({ fbPageToken: encrypt(pageToken), fbAppSecret: encrypt(appSecret), fbPageId: page.id, fbPageName: page.name });
     res.json({ ok: true, pageName: page.name, subscribed, subscribeError });
   }));
 
@@ -373,7 +432,7 @@ router.post('/capture/facebook/:orgId', wrap(async (req, res) => {
   const s = await getSecrets(orgId);
   if (!s || !s.fbAppSecret || !s.fbPageToken) return res.sendStatus(403);
 
-  const expected = 'sha256=' + crypto.createHmac('sha256', s.fbAppSecret).update(req.rawBody || Buffer.from('')).digest('hex');
+  const expected = 'sha256=' + crypto.createHmac('sha256', decrypt(s.fbAppSecret)).update(req.rawBody || Buffer.from('')).digest('hex');
   if (!same(req.headers['x-hub-signature-256'], expected)) return res.sendStatus(403);
 
   const products = await loadProducts(orgId);
@@ -381,7 +440,7 @@ router.post('/capture/facebook/:orgId', wrap(async (req, res) => {
   const changes = (req.body.entry || []).flatMap((e) => e.changes || []).filter((c) => c.field === 'leadgen' && c.value && c.value.leadgen_id);
   for (const c of changes) {
     try {
-      const lead = (await axios.get(`${GRAPH}/${c.value.leadgen_id}`, { params: { access_token: s.fbPageToken }, timeout: 15_000 })).data;
+      const lead = (await axios.get(`${GRAPH}/${c.value.leadgen_id}`, { params: { access_token: decrypt(s.fbPageToken) }, timeout: 15_000 })).data;
       const fields = {};
       (lead.field_data || []).forEach((d) => { fields[d.name] = d.values; });
       const f = mapFields(fields);
@@ -398,4 +457,5 @@ router.post('/capture/facebook/:orgId', wrap(async (req, res) => {
   res.sendStatus(200);   // always 200 once the signature is valid, so Facebook doesn't keep retrying; duplicates are ignored anyway
 }));
 
+router._import = { prepareImport, finishImport, startImportJob };
 module.exports = router;
