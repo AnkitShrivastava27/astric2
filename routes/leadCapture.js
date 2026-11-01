@@ -244,11 +244,13 @@ router.post('/capture/import', requireAuth, rateLimit({ windowMs: 60_000, max: 1
     if (!known) return res.status(400).json({ error: 'Row 1 must be a header row with at least a name, email or phone column.' });
     if (!records.length) return res.status(400).json({ error: 'The file has a header row but no leads.' });
     const prep = await prepareImport(orgId, uid, req.body || {});
+    // The app may say where the file came from ("Google Contacts"); it is shown on every lead as its source.
+    const label = String((req.body || {}).sourceLabel || '').replace(/[\r\n<>]/g, ' ').trim().slice(0, 40) || 'CSV Import';
     if ((req.body || {}).async === true) {
-      const job = await startImportJob({ orgId, uid, records, prep, defaultSource: 'manualWalkIn', sourceLabel: 'CSV Import' });
+      const job = await startImportJob({ orgId, uid, records, prep, defaultSource: 'manualWalkIn', sourceLabel: label });
       return res.status(202).json({ ok: true, async: true, ...job });
     }
-    const result = await ingestMany(orgId, records, { createdBy: uid, defaultSource: 'manualWalkIn', sourceLabel: 'CSV Import', ...prep.opts });
+    const result = await ingestMany(orgId, records, { createdBy: uid, defaultSource: 'manualWalkIn', sourceLabel: label, ...prep.opts });
     res.json({ ok: true, total: records.length, ...result, ...(await finishImport(orgId, prep, result)) });
   }));
 

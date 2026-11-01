@@ -38,9 +38,8 @@
  *                               setting SECRETS_ENCRYPTION_KEY_PREV to the old value (key rotation).
  *
  *  -- Google (Contacts / Drive / Calendar) --------------------------------
- *  Nothing is required here: each company enters ITS OWN Google OAuth Client ID + Secret in the app
- *  (Integrations → Google). GOOGLE_CLIENT_ID / GOOGLE_CLIENT_SECRET are only an optional fallback for a
- *  company that has not set its own.
+ *  Nothing to configure: each company pastes its OWN Google Client ID + Secret into the app, like Salesforce.
+ *  The server only hosts the https redirect page (/oauth/google/callback) that Google requires.
  *
  *  -- Deep link back into the app after OAuth connect (optional) -------------
  *  APP_DEEPLINK_SCHEME        — defaults to "biznexus"

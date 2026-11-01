@@ -23,6 +23,9 @@ const { encrypt, decrypt, mask } = require('../services/secretBox');
 const SCOPES = {
   integration: { col: 'integrations', field: 'credentials' },
   channel: { col: 'connectedChannels', field: 'credentials' },
+  // PERSONAL: kept under the signed-in person's OWN user document, never the company's. Nobody else in the company
+  // (not even the admin) can read it. Used for each person's own Google account tokens.
+  personal: { col: 'integrations_personal', field: 'credentials', own: true },
 };
 const ID_RE = /^[a-zA-Z0-9_-]{2,40}$/;
 
@@ -63,7 +66,7 @@ router.post('/secrets/store', requireAuth, rateLimit({ windowMs: 60_000, max: 30
     stored[k] = val ? encrypt(val) : '';
     masked[k] = val ? mask(stored[k]) : '';
   }
-  const org = await orgOf(req.uid);
+  const org = sc.own ? req.uid : await orgOf(req.uid);
   const extra = {};
   const meta = (req.body || {}).meta;
   if (meta && typeof meta === 'object') {
@@ -85,7 +88,7 @@ router.post('/secrets/store', requireAuth, rateLimit({ windowMs: 60_000, max: 30
 
 router.post('/secrets/reveal', requireAuth, rateLimit({ windowMs: 60_000, max: 60, keyFn: (r) => `secr:${r.uid}` }), handler(async (req, res) => {
   const { sc, id } = scopeOf(req.body);
-  const org = await orgOf(req.uid);
+  const org = sc.own ? req.uid : await orgOf(req.uid);
   const col = db.collection('users').doc(org).collection(sc.col);
   const open = (data) => {
     const out = {};
@@ -105,7 +108,7 @@ router.post('/secrets/reveal', requireAuth, rateLimit({ windowMs: 60_000, max: 6
 router.post('/secrets/delete', requireAuth, handler(async (req, res) => {
   const { sc, id } = scopeOf(req.body);
   if (!ID_RE.test(id)) return res.status(400).json({ error: 'Invalid id.' });
-  const org = await orgOf(req.uid);
+  const org = sc.own ? req.uid : await orgOf(req.uid);
   await db.collection('users').doc(org).collection(sc.col).doc(id).set(
     { [sc.field]: {}, maskedCredentials: {}, connected: false }, { merge: true });
   res.json({ ok: true });

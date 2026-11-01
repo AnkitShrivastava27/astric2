@@ -32,6 +32,12 @@ test('async import answers immediately with a jobId, then progress reaches "done
   const done = await wait(async () => { const j = (await api('GET', `/capture/import/${r.json.jobId}`)).json; if (j.status === 'failed') throw new Error('job failed: ' + j.error); return j.status === 'done' ? j : null; });
   assert.strictEqual(done.created, 60); assert.strictEqual(done.duplicates, 1); assert.strictEqual(done.invalid, 1); assert.strictEqual(done.processed, 62); assert.strictEqual(done.batchName, 'Big file');
 });
+test('an import can name its source, and it is cleaned', async () => {
+  const r = await api('POST', '/capture/import', { csv: 'name,phone\nFrom Google,9855500001', sourceLabel: '  Google Contacts<b>  ' });
+  assert.strictEqual(r.json.created, 1);
+  const l = (await fake.db.collection('users').doc('org1').collection('leads').get()).docs.map((d) => d.data()).find((x) => x.name === 'From Google');
+  assert.strictEqual(l.sourceCustom, 'Google Contacts b');
+});
 test('without the async flag the old behaviour (wait for the result) still works', async () => {
   const r = await api('POST', '/capture/import', { csv: 'name,phone\nSolo,9877700001' });
   assert.strictEqual(r.status, 200); assert.strictEqual(r.json.created, 1);
