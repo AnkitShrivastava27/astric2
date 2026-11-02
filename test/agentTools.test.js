@@ -107,8 +107,8 @@ test('schedule_lead_call (reminder) puts a call on the calendar linked to the le
   const v = await actions.validateAction('schedule_lead_call', { leadName: 'Ravi Sharma', callType: 'reminder', startTime: future(), note: 'Discuss pricing' }, ctx());
   const r = await actions.executeAction('schedule_lead_call', v.echo, ctx());
   assert.strictEqual(r.entity, 'calendar_event');
-  const ev = (await all('calendar_events')).find((e) => e.linkedId === 'l1');
-  assert.strictEqual(ev.title, 'Call Ravi Sharma'); assert.strictEqual(ev.linkedTo, 'lead');
+  const ev = (await all('calendar_private')).find((e) => e.linkedId === 'l1');       // a reminder for the caller: restricted to them
+  assert.strictEqual(ev.title, 'Call Ravi Sharma'); assert.strictEqual(ev.linkedTo, 'lead'); assert.deepStrictEqual(ev.visibleTo, [ORG]);
 });
 test('schedule_lead_call (ai) makes a batch of one and calls the voice service', async () => {
   const calls = [];

@@ -68,7 +68,16 @@ async function resolveOrgContext(uid) {
   if (!orgSnap.exists) return null;
 
   const plan = orgSnap.data().subscription?.plan || 'basic';
-  return { uid, orgOwnerUid, plan, isEmployee: isEmployee && orgOwnerUid !== uid };
+  const isTeamMember = isEmployee && orgOwnerUid !== uid;
+
+  // "Advanced AI access": the admin switches it on per employee (users/{org}/employees/{uid}.aiAdvanced).
+  // Missing = off. Admins always have it. Agent Mode needs it, and it is checked HERE, on the server, so the app cannot skip it.
+  let aiAdvanced = true;
+  if (isTeamMember) {
+    const e = await db.collection('users').doc(orgOwnerUid).collection('employees').doc(uid).get();
+    aiAdvanced = e.exists && e.data().aiAdvanced === true;
+  }
+  return { uid, orgOwnerUid, plan, isEmployee: isTeamMember, aiAdvanced };
 }
 
 module.exports = {

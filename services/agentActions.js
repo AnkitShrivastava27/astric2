@@ -225,6 +225,17 @@ const recentActivities = (arr, n = 8) => (Array.isArray(arr) ? arr : []).map((a)
 const taskBrief = (t) => ({ title: t.title, status: t.status, priority: t.priority, assignedTo: t.assignedTo || '', due: day(t.deadline), overdue: !!(toDate(t.deadline) && toDate(t.deadline) < new Date() && t.status !== 'done') });
 const nameOfBatch = async (ctx, id) => { if (!id) return ''; const b = (await batches(ctx)).find((x) => x.id === id); return b ? b.name : ''; };
 
+/** Calendar events the CALLER may see in [from, to): all shared events (as always) plus restricted ones that list them. */
+async function calendarDocs(ctx, from, to, limit = 200) {
+  const org = orgRef(ctx);
+  const q = (name) => org.collection(name).where('startTime', '>=', from).where('startTime', '<', to).limit(limit).get();
+  const [shared, priv] = await Promise.all([q('calendar_events'), q('calendar_private')]);
+  const out = [];
+  shared.forEach((d) => out.push(d.data()));
+  priv.forEach((d) => { const e = d.data(); if (Array.isArray(e.visibleTo) && e.visibleTo.includes(ctx.uid)) out.push(e); });
+  return out;
+}
+
 const leadBrief = (l) => ({
   id: l.id, name: l.name, phone: l.phone || '', email: l.email || '', company: l.company || '', stage: l.stage, priority: l.priority,
   source: l.source, createdAt: toDate(l.createdAt) ? toDate(l.createdAt).toISOString().slice(0, 10) : '', inBatch: !!l.batchId,
@@ -277,7 +288,8 @@ const WRITE_TOOLS = [
   fn('create_project', 'Create a project.', { name: { type: 'string' }, description: { type: 'string' }, customerName: { type: 'string' } }, ['name']),
   fn('create_calendar_event', 'Add a meeting/event to the calendar.',
     { title: { type: 'string' }, description: { type: 'string' }, location: { type: 'string' }, startTime: { type: 'string', description: dateHelp }, endTime: { type: 'string', description: dateHelp },
-      isAllDay: { type: 'boolean' }, invitedEmployeeNames: { type: 'array', items: { type: 'string' } } }, ['title', 'startTime', 'endTime']),
+      isAllDay: { type: 'boolean' }, invitedEmployeeNames: { type: 'array', items: { type: 'string' } },
+      visibleToEveryone: { type: 'boolean', description: 'Admin only. Default false: only the user and the invited people can see the event.' } }, ['title', 'startTime', 'endTime']),
   fn('create_invoice', 'Create a draft invoice.', { clientName: { type: 'string' }, clientEmail: { type: 'string' }, companyName: { type: 'string' }, dueDate: { type: 'string' },
     items: { type: 'array', items: { type: 'object', properties: { description: { type: 'string' }, quantity: { type: 'number' }, unitPrice: { type: 'number' } }, required: ['description', 'quantity', 'unitPrice'] } }, notes: { type: 'string' } }, ['clientName', 'items']),
   fn('add_note', 'Save a note. Optionally attach it to a lead, customer or project (it then also shows in that lead/customer\'s history).',
@@ -319,10 +331,9 @@ async function runReadTool(name, args, ctx) {
       const to = args.toDate ? String(args.toDate).slice(0, 10) : from;
       if (!/^\d{4}-\d{2}-\d{2}$/.test(from) || !/^\d{4}-\d{2}-\d{2}$/.test(to)) throw new Error('Dates must look like 2026-10-27.');
       const end = new Date(`${to}T00:00:00Z`); end.setUTCDate(end.getUTCDate() + 1);
-      const snap = await orgRef(ctx).collection('calendar_events')
-        .where('startTime', '>=', `${from}T00:00`).where('startTime', '<', `${end.toISOString().slice(0, 10)}T00:00`).limit(200).get();
+      const docs = await calendarDocs(ctx, `${from}T00:00`, `${end.toISOString().slice(0, 10)}T00:00`, 200);
       const ev = [];
-      snap.forEach((d) => { const e = d.data(); ev.push({ title: e.title, start: String(e.startTime).slice(0, 16).replace('T', ' '), end: String(e.endTime || '').slice(0, 16).replace('T', ' '),
+      docs.forEach((e) => { ev.push({ title: e.title, start: String(e.startTime).slice(0, 16).replace('T', ' '), end: String(e.endTime || '').slice(0, 16).replace('T', ' '),
         location: e.location || '', allDay: !!e.isAllDay, bookedOnline: e.source === 'booking', details: clip(e.description, 160) }); });
       ev.sort((a, b) => a.start.localeCompare(b.start));
       return { from, to, count: ev.length, events: ev.slice(0, 40) };
@@ -343,7 +354,7 @@ async function runReadTool(name, args, ctx) {
       ]);
       const today = new Date().toLocaleDateString('en-CA', { timeZone: DEFAULT_TZ });
       const tomorrow = new Date(Date.now() + 86400e3).toLocaleDateString('en-CA', { timeZone: DEFAULT_TZ });
-      const meetings = await count(base.collection('calendar_events').where('startTime', '>=', `${today}T00:00`).where('startTime', '<', `${tomorrow}T00:00`));
+      const meetings = (await calendarDocs(ctx, `${today}T00:00`, `${tomorrow}T00:00`, 500)).length;      // only events this person may see
       let minutesLeft = null;
       try { const w = (await base.collection('voice').doc('wallet').get()).data(); if (w) minutesLeft = Math.max(0, Number(w.minutesPurchased || 0) - Number(w.minutesUsed || 0)); } catch (_) {}
       const stages = Object.fromEntries(leadsByStage);
@@ -554,9 +565,12 @@ async function validateAction(type, params, ctx) {
       try { start = toWall(params.startTime); end = toWall(params.endTime || params.startTime); } catch (_) { throw new Error('startTime and endTime must be valid dates/times.'); }
       if (isAllDay) { start = `${start.slice(0, 10)}T00:00:00.000`; end = `${end.slice(0, 10)}T00:00:00.000`; }
       if (end < start) throw new Error('endTime must be after startTime.');
-      const invited = (await resolveEmployees(ctx, asList(params.invitedEmployeeNames).filter(Boolean)).catch(() => [])).map((e) => e.id);
-      return { normalized: { title, description: optString(params, 'description'), location: optString(params, 'location', { max: 200 }), startTime: start, endTime: end, isAllDay, invitedEmployeeIds: invited },
-        summary: `Add calendar event "${title}" on ${start.slice(0, 10)} at ${isAllDay ? 'all day' : start.slice(11, 16)}.` };
+      // The confirmation sends back the ids we already resolved; only look names up when we were not given ids.
+      const given = asList(params.invitedEmployeeIds).filter((x) => typeof x === 'string' && x);
+      const invited = given.length ? given : (await resolveEmployees(ctx, asList(params.invitedEmployeeNames).filter(Boolean)).catch(() => [])).map((e) => e.id);
+      const everyone = params.visibleToEveryone === true && !ctx.isEmployee;       // only the admin can publish to everyone
+      return { normalized: { title, description: optString(params, 'description'), location: optString(params, 'location', { max: 200 }), startTime: start, endTime: end, isAllDay, invitedEmployeeIds: invited, visibleToEveryone: everyone },
+        summary: `Add calendar event "${title}" on ${start.slice(0, 10)} at ${isAllDay ? 'all day' : start.slice(11, 16)} (${everyone ? 'visible to everyone' : invited.length ? `visible to you and ${invited.length} invited` : 'visible only to you'}).` };
     }
     case 'create_invoice': {
       const clientName = requireString(params, 'clientName');
@@ -781,11 +795,13 @@ async function executeAction(type, params, ctx) {
       return { id: ref.id, entity: 'project' };
     }
     case 'create_calendar_event': {
-      const ref = base.collection('calendar_events').doc();
+      const everyone = n.visibleToEveryone === true && !ctx.isEmployee;
+      const ref = base.collection(everyone ? 'calendar_events' : 'calendar_private').doc();
       const stamp = new Date().toISOString();
       await ref.set({ title: n.title, description: n.description, location: n.location, startTime: n.startTime, endTime: n.endTime, isAllDay: n.isAllDay,
         color: 'teal', repeat: 'none', reminderMinutes: 30, invitedEmployeeIds: n.invitedEmployeeIds, linkedTo: 'none', linkedId: null, linkedLabel: null,
-        attachments: [], createdAt: stamp, updatedAt: stamp, source: 'agent', createdByUid: uid });
+        attachments: [], createdAt: stamp, updatedAt: stamp, source: 'agent', createdByUid: uid, createdBy: uid,
+        ...(everyone ? {} : { visibleTo: [...new Set([uid, ...n.invitedEmployeeIds])] }) });
       return { id: ref.id, entity: 'calendar_event' };
     }
     case 'create_invoice': {
@@ -827,9 +843,9 @@ async function executeAction(type, params, ctx) {
       const lead = { id: ls.id, ...ls.data() };
       if (n.callType === 'reminder') {
         const start = toWall(n.startTime), endD = new Date(parseInTz(n.startTime).getTime() + 15 * 60e3);
-        const ref = base.collection('calendar_events').doc();
+        const ref = base.collection('calendar_private').doc();
         const stamp = new Date().toISOString();
-        await ref.set({ title: `Call ${lead.name}`, description: n.note || `Call ${lead.name}${lead.phone ? ` on ${lead.phone}` : ''}`, location: '', startTime: start, endTime: toWall(endD.toISOString()), isAllDay: false,
+        await ref.set({ visibleTo: [uid], createdBy: uid, title: `Call ${lead.name}`, description: n.note || `Call ${lead.name}${lead.phone ? ` on ${lead.phone}` : ''}`, location: '', startTime: start, endTime: toWall(endD.toISOString()), isAllDay: false,
           color: 'teal', repeat: 'none', reminderMinutes: 15, invitedEmployeeIds: [], linkedTo: 'lead', linkedId: lead.id, linkedLabel: lead.name,
           attachments: [], createdAt: stamp, updatedAt: stamp, source: 'agent', createdByUid: uid });
         return { id: ref.id, entity: 'calendar_event', message: `Reminder set to call ${lead.name}.` };

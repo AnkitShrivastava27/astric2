@@ -89,10 +89,33 @@ test('create_calendar_event stores wall-clock strings like the app and the booki
   assert.strictEqual(v.normalized.startTime, '2026-11-03T15:00:00.000');
   assert.strictEqual(v.normalized.endTime, '2026-11-03T16:00:00.000');
   const r = await actions.executeAction('create_calendar_event', v.normalized, ctx());
-  const ev = (await all('calendar_events')).find((e) => e.id === r.id);
+  const ev = (await all('calendar_private')).find((e) => e.id === r.id);                   // restricted by default
   assert.strictEqual(typeof ev.startTime, 'string'); assert.strictEqual(ev.source, 'agent');
   const back = await actions.runReadTool('get_calendar', { fromDate: '2026-11-03' }, ctx());
-  assert.strictEqual(back.count, 1);                                                      // and the read tool sees it
+  assert.strictEqual(back.count, 1);                                                      // and the read tool sees it (the creator)
+});
+
+test('agent-created events are restricted: the creator and invitees see them, others do not; "everyone" is admin-only', async () => {
+  const admin = ctx();
+  const emp = (uid) => ({ ...ctx(), uid, isEmployee: true });
+  const v = await actions.validateAction('create_calendar_event', { title: 'Private chat', startTime: '2026-12-01T10:00:00', endTime: '2026-12-01T10:30:00', invitedEmployeeNames: ['Priya Shah'] }, admin);
+  assert.deepStrictEqual(v.normalized.invitedEmployeeIds, ['e2']); assert.match(v.summary, /visible to you and 1 invited/);
+  // the confirmation sends the resolved ids back: they must survive execution (they used to be lost)
+  const r = await actions.executeAction('create_calendar_event', v.normalized, admin);
+  const ev = (await all('calendar_private')).find((e) => e.id === r.id);
+  assert.deepStrictEqual(ev.visibleTo.sort(), ['e2', ORG].sort()); assert.strictEqual(ev.createdBy, ORG);
+  const seen = async (c) => (await actions.runReadTool('get_calendar', { fromDate: '2026-12-01' }, c)).count;
+  assert.strictEqual(await seen(admin), 1);          // creator
+  assert.strictEqual(await seen(emp('e2')), 1);      // invited
+  assert.strictEqual(await seen(emp('e3')), 0);      // not concerned
+  // an employee asking for "visible to everyone" is ignored
+  const v2 = await actions.validateAction('create_calendar_event', { title: 'Town hall', startTime: '2026-12-02T10:00:00', endTime: '2026-12-02T11:00:00', visibleToEveryone: true }, emp('e3'));
+  assert.strictEqual(v2.normalized.visibleToEveryone, false);
+  // the admin can publish to everyone: it lands in the shared collection and everybody sees it
+  const v3 = await actions.validateAction('create_calendar_event', { title: 'Company day', startTime: '2026-12-03T10:00:00', endTime: '2026-12-03T11:00:00', visibleToEveryone: true }, admin);
+  const r3 = await actions.executeAction('create_calendar_event', v3.normalized, admin);
+  assert.ok((await all('calendar_events')).some((e) => e.id === r3.id));
+  assert.strictEqual((await actions.runReadTool('get_calendar', { fromDate: '2026-12-03' }, emp('e3'))).count, 1);
 });
 
 test('bulk_create_leads creates leads in one batch and skips duplicates', async () => {

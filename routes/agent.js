@@ -76,6 +76,9 @@ router.post('/ai/agent', requireAuth, rateLimit({ windowMs: 60_000, max: 20, key
     if (ctx.plan !== 'premium') {
       return res.status(403).json({ error: 'Agent Mode is a Premium feature.', requiresUpgrade: true });
     }
+    if (!ctx.aiAdvanced) {
+      return res.status(403).json({ error: 'Agent Mode is not enabled for your account. Ask your admin to switch on "Advanced AI access" for you.', notAllowed: true });
+    }
 
     const modelCfg = await getAgentModelConfig();
     if (!modelCfg) {
@@ -193,6 +196,9 @@ router.post('/ai/agent/execute', requireAuth, rateLimit({ windowMs: 60_000, max:
     if (!ctx) return res.status(404).json({ error: 'User not found.' });
     if (ctx.plan !== 'premium') {
       return res.status(403).json({ error: 'Agent Mode is a Premium feature.', requiresUpgrade: true });
+    }
+    if (!ctx.aiAdvanced) {
+      return res.status(403).json({ error: 'Agent Mode is not enabled for your account. Ask your admin to switch on "Advanced AI access" for you.', notAllowed: true });
     }
 
     // Double-tap / retry protection: the same requestId can only run once. A second call gets the first result back.

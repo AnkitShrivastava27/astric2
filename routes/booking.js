@@ -116,17 +116,20 @@ async function slotsFor(orgId, s, dateStr) {
   if (dayMs > todayStart + s.maxDaysAhead * 86400e3 || dayMs + 86400e3 <= earliest) return [];
 
   // Everything already in the calendar around that day blocks the time (all-day events block the whole day).
-  const snap = await db.collection('users').doc(orgId).collection('calendar_events')
-    .where('startTime', '>=', `${fmtDate(dayMs - 86400e3)}T00:00`)
-    .where('startTime', '<', `${fmtDate(dayMs + 2 * 86400e3)}T00:00`).get();
+  const from = `${fmtDate(dayMs - 86400e3)}T00:00`, to = `${fmtDate(dayMs + 2 * 86400e3)}T00:00`;
   const busy = [];
-  snap.forEach((d) => {
-    const e = d.data();
-    const a = parseWall(e.startTime); let b = parseWall(e.endTime);
+  const addBusy = (e) => {
+    const a = parseWall(e.startTime); const b = parseWall(e.endTime);
     if (a === null) return;
     if (e.isAllDay === true) { busy.push([Math.floor(a / 86400e3) * 86400e3, Math.floor((b ?? a) / 86400e3) * 86400e3 + 86400e3]); return; }
     busy.push([a, b === null || b <= a ? a + 30 * 60e3 : b]);
-  });
+  };
+  const orgRef = db.collection('users').doc(orgId);
+  (await orgRef.collection('calendar_events').where('startTime', '>=', from).where('startTime', '<', to).get()).forEach((d) => addBusy(d.data()));
+  // Restricted events (calendar_private) that include the owner also block the time. Date-range query only: filtering by
+  // "who can see it" happens here, so no extra Firestore index is needed.
+  (await orgRef.collection('calendar_private').where('startTime', '>=', from).where('startTime', '<', to).get())
+    .forEach((d) => { const e = d.data(); if (Array.isArray(e.visibleTo) && e.visibleTo.includes(orgId)) addBusy(e); });
 
   const dur = s.durationMin * 60e3; const buf = s.bufferMin * 60e3;
   const out = [];
@@ -325,4 +328,5 @@ router.post('/book/:orgId/:slug',
     res.json({ ok: true });
   }));
 
+router._test = { slotsFor, normalize };      // exposed for tests only
 module.exports = router;
