@@ -180,6 +180,8 @@ async function ingestLead(orgId, f, { createdBy = '', defaultSource = 'websiteFo
     // Unassigned leads are visible to the admin only; a person importing their own sees them too.
     visibleTo: createdBy ? [createdBy] : [],
     phoneNorm, createdAt: FV.serverTimestamp(),
+    // Lower-cased copies the app's paged Leads list searches on (mirrors LeadModel.toFirestore).
+    nameLower: name.slice(0, 120).toLowerCase(), emailLower: email,
   };
 
   try {

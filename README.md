@@ -70,10 +70,12 @@ const updatePricing = async (req, res) => {
       'Authorization': `Bearer ${process.env.CASHFREE_SERVER_ADMIN_KEY}`, // same as ADMIN_API_KEY
     },
     body: JSON.stringify({
-      standard_monthly: 999,
-      standard_annual:  799,
-      premium_monthly:  1999,
-      premium_annual:   1599,
+      standard_monthly:   999,
+      standard_quarterly: 2699,
+      standard_annual:    799,
+      premium_monthly:    1999,
+      premium_quarterly:  5399,
+      premium_annual:     1599,
       updatedBy: req.user.email,   // from your MERN auth middleware
     }),
   });

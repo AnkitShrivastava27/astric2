@@ -14,8 +14,8 @@ const adminLimit = rateLimit({ windowMs: 60_000, max: 20, keyFn: r => `admin:${r
 router.post('/update-pricing', requireAdmin, adminLimit, async (req, res) => {
   try {
     const priceFields = [
-      'basic_monthly', 'basic_annual', 'standard_monthly', 'standard_annual',
-      'premium_monthly', 'premium_annual', 'token_pack_price',
+      'basic_monthly', 'basic_annual', 'standard_monthly', 'standard_quarterly', 'standard_annual',
+      'premium_monthly', 'premium_quarterly', 'premium_annual', 'token_pack_price',
       // Image Studio top-up pack: INR price per pack (images per pack = image_pack_size below).
       'image_pack_price', 'paypal_image_pack_price',
       // NOTE: these three were already sent by the admin panel
@@ -29,8 +29,8 @@ router.post('/update-pricing', requireAdmin, adminLimit, async (req, res) => {
       // WhatsApp Automation subscription pricing (see routes/whatsapp-subscription.js)
       'whatsapp_monthly_price', 'whatsapp_annual_price',
       // PayPal-only USD price list (see services/pricing.js getPaypalUsd).
-      'paypal_standard_monthly', 'paypal_standard_annual',
-      'paypal_premium_monthly', 'paypal_premium_annual',
+      'paypal_standard_monthly', 'paypal_standard_quarterly', 'paypal_standard_annual',
+      'paypal_premium_monthly', 'paypal_premium_quarterly', 'paypal_premium_annual',
       'paypal_token_pack_price',
       'paypal_website_trial', 'paypal_website_standard', 'paypal_website_pro',
       'paypal_app_trial', 'paypal_app_standard', 'paypal_app_pro',

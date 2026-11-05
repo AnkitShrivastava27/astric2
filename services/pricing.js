@@ -15,8 +15,10 @@ async function getCanonicalPrice(planType, cycle) {
   const snap = await db.collection('pricing_config').doc('plans').get();
   const defaults = {
     standard_monthly: 830,
+    standard_quarterly: 2490,
     standard_annual: 664,
     premium_monthly: 1660,
+    premium_quarterly: 4980,
     premium_annual: 1245,
     token_pack_price: 10,
   };
@@ -28,6 +30,12 @@ async function getCanonicalPrice(planType, cycle) {
   return Number(price);
 }
 
+// Subscription end date for a purchase made at [now]: 1, 3 or 12 months for monthly, quarterly or annual.
+const CYCLE_MONTHS = { monthly: 1, quarterly: 3, annual: 12 };
+function planExpiry(now, cycle) {
+  return new Date(now.getFullYear(), now.getMonth() + (CYCLE_MONTHS[cycle] || 1), now.getDate());
+}
+
 async function getTokenPackPrice() {
   const snap = await db.collection('pricing_config').doc('plans').get();
   return snap.exists ? Number(snap.data().token_pack_price ?? 10) : 10;
@@ -36,7 +44,7 @@ async function getTokenPackPrice() {
 // ── PayPal (USD) pricing ────────────────────────────────────────────────────
 // PayPal has its OWN price list, set in the admin panel, stored in the same
 // pricing_config/plans doc as USD fields (all optional):
-//   paypal_standard_monthly / _annual, paypal_premium_monthly / _annual
+//   paypal_standard_monthly / _quarterly / _annual, paypal_premium_monthly / _quarterly / _annual
 //   paypal_token_pack_price  (USD per pack)
 //   paypal_token_pack_size   (tokens per pack, e.g. $5 -> 500 tokens)
 //   paypal_website_trial|standard|pro, paypal_app_trial|standard|pro
@@ -95,4 +103,4 @@ async function getPaypalImagePack() {
   return { priceUSD: await inrToUsd(inr.price), imagesPerPack: inr.size, custom: false };
 }
 
-module.exports = { getPaypalImagePack, getImagePack, inrToUsd, getCanonicalPrice, getTokenPackPrice, getPaypalUsd, getPaypalTokenPack };
+module.exports = { getPaypalImagePack, getImagePack, inrToUsd, getCanonicalPrice, getTokenPackPrice, getPaypalUsd, getPaypalTokenPack, planExpiry };

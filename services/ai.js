@@ -63,7 +63,7 @@ function effectiveSubscription(sub) {
   const num = (v) => (v === null || v === undefined || v === '' || isNaN(Number(v)) ? null : Math.max(0, Math.floor(Number(v))));
   return {
     plan: expired ? 'basic' : stored,
-    cycle: s.cycle === 'annual' ? 'annual' : 'monthly',
+    cycle: ['quarterly', 'annual'].includes(s.cycle) ? s.cycle : 'monthly',
     expired: !!expired,
     custom: expired ? { aiTokens: null, images: null } : { aiTokens: num(s.customLimits?.aiTokens), images: num(s.customLimits?.images) },
   };

@@ -19,6 +19,7 @@ const { db } = require('../config/firebase');
 const { requireAuth } = require('../middleware/auth');
 const { rateLimit } = require('../middleware/rateLimit');
 
+const CYCLE_LABEL = { monthly: 'Monthly', quarterly: 'Quarterly', annual: 'Annual' };
 const cap = (s) => (s ? String(s).charAt(0).toUpperCase() + String(s).slice(1) : '');
 const num = (n) => Number(n || 0).toLocaleString('en-US');
 
@@ -28,7 +29,7 @@ const SOURCES = [
     product: (o) => (o.orderType === 'tokens' ? 'tokens' : 'plan'),
     title: (o) => (o.orderType === 'tokens'
       ? `AI tokens — ${num(o.tokensToAdd || (o.tokenPacks || 0) * 10000)}`
-      : `${cap(o.planType) || 'Plan'} plan — ${o.cycle === 'annual' ? 'Annual' : 'Monthly'}`),
+      : `${cap(o.planType) || 'Plan'} plan — ${CYCLE_LABEL[o.cycle] || 'Monthly'}`),
   },
   { collection: 'websiteCreditOrders',        product: () => 'website',  title: (o) => `Website Studio — ${cap(o.tier) || 'pack'}` },
   { collection: 'appCreditOrders',            product: () => 'app',      title: (o) => `App Studio — ${cap(o.tier) || 'pack'}` },

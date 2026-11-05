@@ -6,7 +6,7 @@ const axios = require('axios');
 const { v4: uuidv4 } = require('uuid');
 const { admin, db } = require('../config/firebase');
 const { PP_ENV, PP_CLIENT_ID, PP_BASE_URL, getPayPalAccessToken, ppHeaders } = require('../services/paypal');
-const { getCanonicalPrice, getPaypalUsd, getPaypalTokenPack, getPaypalImagePack } = require('../services/pricing');
+const { getCanonicalPrice, getPaypalUsd, getPaypalTokenPack, getPaypalImagePack, planExpiry } = require('../services/pricing');
 const { resolveOrgBilling } = require('../services/ai');
 const { requireAuth } = require('../middleware/auth');
 const { rateLimit } = require('../middleware/rateLimit');
@@ -47,7 +47,7 @@ router.post('/paypal/create-order', requireAuth, rateLimit({ windowMs: 60_000, m
     const uid = req.uid;
 
     if (!['standard', 'premium'].includes(planType)) return res.status(400).json({ error: `Invalid planType: ${planType}` });
-    if (!['monthly', 'annual'].includes(cycle)) return res.status(400).json({ error: `Invalid cycle: ${cycle}` });
+    if (!['monthly', 'quarterly', 'annual'].includes(cycle)) return res.status(400).json({ error: `Invalid cycle: ${cycle}` });
     if (!userEmail) return res.status(400).json({ error: 'userEmail is required.' });
 
     const amountINR = await getCanonicalPrice(planType, cycle);
@@ -154,9 +154,7 @@ router.get('/paypal/capture-order', async (req, res) => {
     }
 
     const now = new Date();
-    const expiry = cycle === 'monthly'
-      ? new Date(now.getFullYear(), now.getMonth() + 1, now.getDate())
-      : new Date(now.getFullYear() + 1, now.getMonth(), now.getDate());
+    const expiry = planExpiry(now, cycle);
 
     const subscriptionData = {
       plan: planType, cycle, active: true,
