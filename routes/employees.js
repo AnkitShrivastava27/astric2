@@ -19,7 +19,7 @@
 //   POST   /employees              -> create (checks limit, creates login + records)
 //   PATCH  /employees/:id          -> edit details (optionally email / password)
 //   DELETE /employees/:id          -> remove login + records + every reference (chat, leads, tasks...)
-//   POST   /employees/cleanup-orphans -> repair leftovers from employees deleted earlier
+//   POST   /employees/cleanup-orphans -> repair leftovers from employees deleted earlier (max once per 24 h)
 //   POST   /employees/sync-team-chat -> make sure every employee is in the team group chat
 'use strict';
 
@@ -273,12 +273,38 @@ router.delete('/employees/:id', requireAuth, wrap(async (req, res) => {
 // ── POST /employees/cleanup-orphans ───────────────────────────────────────────
 // Repairs data left behind by employees deleted BEFORE the full clean-up existed (stale chat
 // members, DMs, lead/customer owners, shares). Idempotent; called by the admin app on start.
+//
+// The sweep reads EVERY lead and customer (plus chat rooms and file shares) — thousands of billed Firestore
+// reads — and the admin app calls this on every start. So it runs at most once per 24 h per company: the first
+// call claims the slot (users/{admin}.orphanSweepAt), later calls return immediately for the cost of one read.
+const SWEEP_EVERY_MS = 24 * 60 * 60 * 1000;
+
+async function claimOrphanSweep(adminId) {
+  const ref = db.collection('users').doc(adminId);
+  return db.runTransaction(async (tx) => {
+    const snap = await tx.get(ref);
+    const at = snap.exists ? snap.data().orphanSweepAt : null;
+    const last = at && typeof at.toMillis === 'function' ? at.toMillis() : 0;
+    if (Date.now() - last < SWEEP_EVERY_MS) return false;
+    tx.set(ref, { orphanSweepAt: admin.firestore.FieldValue.serverTimestamp() }, { merge: true });
+    return true;
+  });
+}
+
 router.post('/employees/cleanup-orphans',
   requireAuth,
   rateLimit({ windowMs: 60_000, max: 4, keyFn: r => `emp-orphans:${r.uid}` }),
   wrap(async (req, res) => {
     await requireAdminUser(req.uid);
-    res.json({ ok: true, ...(await repairOrphans(req.uid)) });
+    if (!(await claimOrphanSweep(req.uid))) return res.json({ ok: true, skipped: true, orphans: 0 });
+    try {
+      res.json({ ok: true, ...(await repairOrphans(req.uid)) });
+    } catch (e) {
+      // Let the next app start try again instead of waiting a whole day.
+      await db.collection('users').doc(req.uid)
+        .update({ orphanSweepAt: admin.firestore.FieldValue.delete() }).catch(() => {});
+      throw e;
+    }
   }));
 
 // ── POST /employees/sync-team-chat ────────────────────────────────────────────
