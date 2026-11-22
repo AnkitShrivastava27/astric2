@@ -22,7 +22,11 @@ module.exports = {
   FIREBASE_PRIVATE_KEY: (process.env.FIREBASE_PRIVATE_KEY || '').replace(/\\n/g, '\n'),
 
   // -- Cashfree ----------------------------------------------------------------
-  CF_ENV: (process.env.CASHFREE_ENV || 'TEST').toUpperCase(),
+  // Normalised to exactly 'PROD' or 'TEST' so the API base URL (services/cashfree.js)
+  // and the `environment` sent to the app can never disagree (e.g. 'PRODUCTION').
+  CF_ENV: ['PROD', 'PRODUCTION', 'LIVE'].includes(String(process.env.CASHFREE_ENV || '').trim().toUpperCase())
+    ? 'PROD'
+    : 'TEST',
   CF_APP_ID: process.env.CASHFREE_APP_ID || '',
   CF_SECRET_KEY: process.env.CASHFREE_SECRET_KEY || '',
 

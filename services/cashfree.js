@@ -15,4 +15,14 @@ function cfHeaders() {
   };
 }
 
-module.exports = { CF_ENV, CF_BASE_URL, cfHeaders };
+// Cashfree sometimes returns a payment_session_id ending in "paymentpayment".
+// Native SDKs tolerate it, but the browser checkout rejects it with
+// {"code":"payment_session_id_invalid"}. Strip the duplicated suffix once,
+// here, so every create-order route hands clients a clean id.
+function cleanSessionId(id) {
+  let s = String(id || '').trim();
+  while (s.endsWith('paymentpayment')) s = s.slice(0, -'payment'.length);
+  return s;
+}
+
+module.exports = { CF_ENV, CF_BASE_URL, cfHeaders, cleanSessionId };

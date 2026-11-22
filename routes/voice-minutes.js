@@ -37,7 +37,7 @@ const router = express.Router();
 const axios = require('axios');
 const { v4: uuidv4 } = require('uuid');
 const { admin, db } = require('../config/firebase');
-const { CF_ENV, CF_BASE_URL, cfHeaders } = require('../services/cashfree');
+const { CF_ENV, CF_BASE_URL, cfHeaders, cleanSessionId } = require('../services/cashfree');
 const { inrToUsd } = require('../services/pricing');
 const { requireAuth } = require('../middleware/auth');
 const { rateLimit } = require('../middleware/rateLimit');
@@ -212,7 +212,7 @@ router.post('/create-voice-order', requireAuth, rateLimit({ windowMs: 60_000, ma
     };
 
     const cfRes = await axios.post(`${CF_BASE_URL}/orders`, cfPayload, { headers: cfHeaders() });
-    const paymentSessionId = cfRes.data?.payment_session_id;
+    const paymentSessionId = cleanSessionId(cfRes.data?.payment_session_id);
     if (!paymentSessionId) {
       console.error('Cashfree did not return payment_session_id:', cfRes.data);
       return res.status(500).json({ error: 'Cashfree did not return a payment session.' });

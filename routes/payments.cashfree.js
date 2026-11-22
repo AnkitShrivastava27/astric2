@@ -5,7 +5,7 @@ const router = express.Router();
 const axios = require('axios');
 const { v4: uuidv4 } = require('uuid');
 const { admin, db } = require('../config/firebase');
-const { CF_ENV, CF_BASE_URL, cfHeaders } = require('../services/cashfree');
+const { CF_ENV, CF_BASE_URL, cfHeaders, cleanSessionId } = require('../services/cashfree');
 const { getCanonicalPrice, getTokenPackPrice, getImagePack, planExpiry } = require('../services/pricing');
 const { resolveOrgBilling } = require('../services/ai');
 const { requireAuth } = require('../middleware/auth');
@@ -53,7 +53,7 @@ router.post('/create-order', requireAuth, rateLimit({ windowMs: 60_000, max: 10,
     };
 
     const cfRes = await axios.post(`${CF_BASE_URL}/orders`, cfPayload, { headers: cfHeaders() });
-    const paymentSessionId = cfRes.data?.payment_session_id;
+    const paymentSessionId = cleanSessionId(cfRes.data?.payment_session_id);
     if (!paymentSessionId) {
       console.error('Cashfree did not return payment_session_id:', cfRes.data);
       return res.status(500).json({ error: 'Cashfree did not return a payment session.' });
@@ -111,7 +111,7 @@ router.post('/create-token-order', requireAuth, rateLimit({ windowMs: 60_000, ma
     };
 
     const cfRes = await axios.post(`${CF_BASE_URL}/orders`, cfPayload, { headers: cfHeaders() });
-    const paymentSessionId = cfRes.data?.payment_session_id;
+    const paymentSessionId = cleanSessionId(cfRes.data?.payment_session_id);
     if (!paymentSessionId) {
       console.error('Cashfree did not return payment_session_id:', cfRes.data);
       return res.status(500).json({ error: 'Cashfree did not return a payment session.' });
@@ -226,7 +226,7 @@ router.post('/create-image-order', requireAuth, rateLimit({ windowMs: 60_000, ma
       order_note: `${imagesToAdd} Image Studio images (${packs} pack${packs > 1 ? 's' : ''}) — ${CF_ENV}`,
     };
     const cfRes = await axios.post(`${CF_BASE_URL}/orders`, cfPayload, { headers: cfHeaders() });
-    const paymentSessionId = cfRes.data?.payment_session_id;
+    const paymentSessionId = cleanSessionId(cfRes.data?.payment_session_id);
     if (!paymentSessionId) {
       console.error('Cashfree did not return payment_session_id:', cfRes.data);
       return res.status(500).json({ error: 'Cashfree did not return a payment session.' });
